@@ -230,36 +230,6 @@ body {
   animation: digitPulse 700ms ease;
 }
 
-.speaking-card {
-  border-color: var(--accent) !important;
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
-}
-
-.voice-wave {
-  position: relative;
-  display: inline-flex;
-  width: 16px;
-  height: 16px;
-  align-items: center;
-  justify-content: center;
-  border-radius: 999px;
-  background: var(--accent);
-}
-
-.voice-wave::before,
-.voice-wave::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  border: 1px solid var(--accent);
-  animation: voicePulse 1.25s ease-out infinite;
-}
-
-.voice-wave::after {
-  animation-delay: 0.35s;
-}
-
 @keyframes digitPulse {
   0% {
     transform: scale(1);
@@ -272,17 +242,6 @@ body {
   100% {
     transform: scale(1);
     box-shadow: 0 0 0 0 transparent;
-  }
-}
-
-@keyframes voicePulse {
-  0% {
-    opacity: 0.65;
-    transform: scale(0.85);
-  }
-  100% {
-    opacity: 0;
-    transform: scale(1.9);
   }
 }
 

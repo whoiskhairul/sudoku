@@ -1,20 +1,12 @@
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  LiveKitRoom,
-  RoomAudioRenderer,
-  StartAudio,
-  useLocalParticipant,
-  useSpeakingParticipants,
-} from "@livekit/components-react";
-import {
   BarChart3,
   Check,
   Clipboard,
+  Link2,
   Crown,
   LogOut,
   Eye,
-  Mic,
-  MicOff,
   Moon,
   Pause,
   Pencil,
@@ -25,12 +17,10 @@ import {
   Sun,
   Trash2,
   Users,
-  Volume2,
-  VolumeX,
   Wifi,
   WifiOff,
+  X,
 } from "lucide-react";
-import { Track } from "livekit-client";
 import { QRCodeSVG } from "qrcode.react";
 import React, { useCallback, useEffect, useState } from "react";
 import { create } from "zustand";
@@ -55,15 +45,11 @@ const themes = {
 
 const blankNotes = () => Array.from({ length: 81 }, () => []);
 const now = () => Date.now();
-const ONLINE_GRACE_MS = 6000;
+const ONLINE_GRACE_MS = 15000;
 const EMPTY_ROOM_TTL_MS = 180000;
-const MICROPHONE_CONSTRAINTS = {
-  echoCancellation: true,
-  noiseSuppression: true,
-  autoGainControl: true,
-};
-const isPlayerOnline = (player, ts = now()) =>
-  Boolean(player?.connected) && ts - (player?.lastSeen || 0) < ONLINE_GRACE_MS;
+const DARK_THEME = "Cyberpunk";
+const LIGHT_THEME = "Nordic";
+const isPlayerOnline = (player, ts = now()) => ts - (player?.lastSeen || 0) < ONLINE_GRACE_MS;
 const getPauseVoterIds = (room, ts = now()) =>
   Object.values(room?.players || {})
     .filter((p) => isPlayerOnline(p, ts))
@@ -76,6 +62,38 @@ const syncRoomUrl = (code, mode = "replace") => {
   if (current === next) return;
   const method = mode === "push" ? "pushState" : "replaceState";
   window.history[method]({}, "", next);
+};
+const mergeRoomPresence = (currentRoom, nextRoom) => {
+  if (!currentRoom || !nextRoom || currentRoom.code !== nextRoom.code) return nextRoom;
+  const currentPlayers = currentRoom.players || {};
+  const incomingPlayers = nextRoom.players || {};
+  const mergedPlayers = {};
+  const playerIds = new Set([...Object.keys(currentPlayers), ...Object.keys(incomingPlayers)]);
+  playerIds.forEach((id) => {
+    const prev = currentPlayers[id];
+    const incoming = incomingPlayers[id];
+    if (!prev && incoming) {
+      mergedPlayers[id] = incoming;
+      return;
+    }
+    if (prev && !incoming) {
+      mergedPlayers[id] = prev;
+      return;
+    }
+    if (!prev || !incoming) return;
+    const prevSeen = prev.lastSeen || 0;
+    const incomingSeen = incoming.lastSeen || 0;
+    if (incomingSeen > prevSeen) {
+      mergedPlayers[id] = incoming;
+      return;
+    }
+    if (incomingSeen < prevSeen) {
+      mergedPlayers[id] = prev;
+      return;
+    }
+    mergedPlayers[id] = prev.connected && !incoming.connected ? { ...incoming, connected: true } : incoming;
+  });
+  return { ...nextRoom, players: mergedPlayers };
 };
 
 const copyText = async (text) => {
@@ -99,18 +117,6 @@ const copyText = async (text) => {
   } catch (e) {
     return false;
   }
-};
-
-const microphoneSupportError = () => {
-  if (typeof window === "undefined") return "Microphone is unavailable in this browser.";
-  if (typeof navigator !== "undefined" && navigator.mediaDevices?.getUserMedia) {
-    return "";
-  }
-  const origin = window.location?.origin ? ` Current page: ${window.location.origin}` : "";
-  if (!window.isSecureContext) {
-    return `Microphone access is unavailable on this page. Use http://localhost:5173, http://127.0.0.1:5173, or HTTPS.${origin}`;
-  }
-  return `This browser does not expose microphone access here.${origin}`;
 };
 
 const playSound = (frequency, duration = 100, type = "sine") => {
@@ -247,32 +253,16 @@ const useGame = create((set, get) => ({
   ws: null,
   viewingId: null,
   history: [],
-  speakerMuted: localStorage.getItem("sv-speaker-muted") === "true",
-  voiceConnected: false,
-  voiceError: "",
-  voiceSpeakingIds: [],
   stats: readJSON("sv-stats", defaultStats),
   setTheme: (theme) => {
     localStorage.setItem("sv-theme", theme);
     set({ theme });
   },
-  setSpeakerMuted: (speakerMuted) => {
-    localStorage.setItem("sv-speaker-muted", String(speakerMuted));
-    set({ speakerMuted });
-  },
-  setVoiceConnected: (voiceConnected) => set({ voiceConnected }),
-  setVoiceError: (voiceError) => set({ voiceError }),
-  setVoiceSpeakingIds: (voiceSpeakingIds) => set({ voiceSpeakingIds }),
-  setLocalAudioMuted: (audioMuted) => {
-    const { room, player, publish } = get();
-    if (!room?.players?.[player.id]) return;
-    publish({
-      ...room,
-      players: {
-        ...room.players,
-        [player.id]: { ...room.players[player.id], audioMuted, lastSeen: now() },
-      },
-    });
+  toggleDarkMode: () => {
+    const current = get().theme;
+    const next = current === DARK_THEME ? LIGHT_THEME : DARK_THEME;
+    localStorage.setItem("sv-theme", next);
+    set({ theme: next });
   },
   setPlayerName: (name) => {
     const trimmed = String(name || "").trim();
@@ -298,7 +288,7 @@ const useGame = create((set, get) => ({
       return { stats };
     }),
   publish: (room) => {
-    const next = { ...room, updatedAt: now() };
+    const next = mergeRoomPresence(get().room, { ...room, updatedAt: now() });
     writeRoom(next);
     get().channel?.postMessage(next);
     // also publish to server via websocket when available
@@ -336,7 +326,8 @@ const useGame = create((set, get) => ({
           mistakes: 0,
           progress: 0,
           finishedMs: null,
-          audioMuted: false,
+          personalSolvedAt: null,
+          personalSolvedDismissed: false,
           board: [...puzzle.puzzle],
           notes: blankNotes(),
           lastSeen: now(),
@@ -379,7 +370,8 @@ const useGame = create((set, get) => ({
             mistakes: 0,
             progress: 0,
             finishedMs: null,
-            audioMuted: false,
+            personalSolvedAt: null,
+            personalSolvedDismissed: false,
             board: [...found.puzzle],
             notes: blankNotes(),
             lastSeen: now(),
@@ -426,7 +418,8 @@ const useGame = create((set, get) => ({
             mistakes: 0,
             progress: 0,
             finishedMs: null,
-            audioMuted: false,
+            personalSolvedAt: null,
+            personalSolvedDismissed: false,
             board: [...roomData.puzzle],
             notes: blankNotes(),
             lastSeen: now(),
@@ -463,8 +456,9 @@ const useGame = create((set, get) => ({
     publish({
       ...room,
       players,
-      status: allReady ? "playing" : "lobby",
-      startedAt: allReady ? now() : room.startedAt,
+      status: allReady ? "countdown" : "lobby",
+      countdownEndsAt: allReady ? now() + 3000 : null,
+      startedAt: allReady ? null : room.startedAt,
     });
   },
   setSelected: (selected) => set({ selected }),
@@ -551,9 +545,11 @@ const useGame = create((set, get) => ({
     const { room, player, selected, inputMode, publish, history, saveStats, countPlaced } = get();
     const me = room?.players?.[player.id];
     if (!room || !me || selected === null || room.puzzle[selected] || room.pausedAt || me.status === "spectating" || me.status === "lost") return;
+    if (room.status === "countdown") return;
     if (get().viewingId && get().viewingId !== player.id) return;
     if (inputMode === "value" && countPlaced(me.board, digit) >= 9) return;
     if (room.status === "ended" && me.status !== "continue") return;
+    if (inputMode === "value" && me.board[selected] === digit) return;
 
     const snapshot = {
       board: [...me.board],
@@ -589,11 +585,16 @@ const useGame = create((set, get) => ({
     const progress = Math.round((board.filter(Boolean).length / 81) * 100);
     let winnerId = room.winnerId;
     let roomStatus = room.status;
-    if (!winnerId && board.every((value, idx) => value === room.solution[idx]) && mistakes <= 2) {
+    const solved = board.every((value, idx) => value === room.solution[idx]);
+    let personalSolvedAt = me.personalSolvedAt ?? null;
+    let personalSolvedDismissed = me.personalSolvedDismissed ?? false;
+    if (!winnerId && solved && mistakes <= 2) {
       winnerId = player.id;
       roomStatus = "ended";
       status = "winner";
       const elapsed = now() - room.startedAt - room.totalPausedMs;
+      personalSolvedAt = elapsed;
+      personalSolvedDismissed = true;
       const best = get().stats.bestTimes[room.difficulty];
       saveStats({
         played: get().stats.played + 1,
@@ -607,6 +608,9 @@ const useGame = create((set, get) => ({
         losses: get().stats.losses + 1,
         mistakeHistory: [...get().stats.mistakeHistory.slice(-19), mistakes],
       });
+    } else if (winnerId && solved && status === "continue" && !personalSolvedAt) {
+      personalSolvedAt = room.startedAt ? now() - room.startedAt - room.totalPausedMs : 0;
+      personalSolvedDismissed = false;
     }
 
     const finishedMs =
@@ -627,6 +631,8 @@ const useGame = create((set, get) => ({
           progress,
           status,
           finishedMs,
+          personalSolvedAt,
+          personalSolvedDismissed,
           lossPromptDismissed: status === "lost" ? false : me.lossPromptDismissed,
           lastSeen: now(),
         },
@@ -682,8 +688,18 @@ function App() {
   const publish = useGame((s) => s.publish);
   const joinRoom = useGame((s) => s.joinRoom);
   const leaveRoom = useGame((s) => s.leaveRoom);
+  const setTheme = useGame((s) => s.setTheme);
   const ws = useGame((s) => s.ws);
+  const [snacks, setSnacks] = useState([]);
+  const prevRoomRef = React.useRef(null);
   const [urlJoinPending, setUrlJoinPending] = useState(() => Boolean(new URLSearchParams(location.search).get("room")));
+  const addSnack = useCallback((text) => {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    setSnacks((items) => [...items, { id, text }].slice(-5));
+    setTimeout(() => {
+      setSnacks((items) => items.filter((item) => item.id !== id));
+    }, 2800);
+  }, []);
 
   useEffect(() => {
     const channel = new BroadcastChannel("sudoku-versus");
@@ -691,53 +707,88 @@ function App() {
     channel.onmessage = (event) => {
       const current = useGame.getState().room;
       if (!current || event.data.code !== current.code) return;
-      if ((event.data.updatedAt || 0) >= (current.updatedAt || 0)) useGame.setState({ room: event.data });
+      if ((event.data.updatedAt || 0) >= (current.updatedAt || 0)) {
+        useGame.setState({ room: mergeRoomPresence(current, event.data) });
+      }
     };
     const onLocal = (event) => {
       const current = useGame.getState().room;
       if (current?.code === event.detail.code && event.detail.updatedAt >= (current.updatedAt || 0)) {
-        useGame.setState({ room: event.detail });
+        useGame.setState({ room: mergeRoomPresence(current, event.detail) });
       }
     };
+    const onSnack = (event) => {
+      if (event?.detail?.message) addSnack(event.detail.message);
+    };
     window.addEventListener("sv-room-local", onLocal);
+    window.addEventListener("sv-snack", onSnack);
 
-    // attempt to connect to websocket server for cross-device sync
-    try {
-      const wsUrl = (location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.hostname + ":5174";
-      const ws = new WebSocket(wsUrl);
-      ws.addEventListener("open", () => useGame.setState({ ws }));
-      ws.addEventListener("message", (ev) => {
-        let msg;
-        try {
-          msg = JSON.parse(ev.data);
-        } catch (e) {
-          return;
-        }
-        if (msg?.type === "room") {
-          // if server responded to a GET, it may include `code` even when room is null
-          if (msg.code) {
-            const pending = pendingGets.get(msg.code.toUpperCase());
-            if (pending) {
-              pending.resolve(msg.room || null);
-              pendingGets.delete(msg.code.toUpperCase());
+    // websocket cross-device sync with auto-reconnect
+    let reconnectTimer = null;
+    let disposed = false;
+    const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrls = [
+      `${wsProtocol}//${location.host}/room-ws`,
+      `${wsProtocol}//${location.hostname}:5174/room-ws`,
+      `${wsProtocol}//${location.hostname}:5174`,
+    ];
+    const connectWs = (attempt = 0) => {
+      if (disposed) return;
+      const wsUrl = wsUrls[attempt % wsUrls.length];
+      try {
+        const ws = new WebSocket(wsUrl);
+        let opened = false;
+        ws.addEventListener("open", () => useGame.setState({ ws }));
+        ws.addEventListener("open", () => {
+          opened = true;
+        });
+        ws.addEventListener("message", (ev) => {
+          let msg;
+          try {
+            msg = JSON.parse(ev.data);
+          } catch (e) {
+            return;
+          }
+          if (msg?.type === "room") {
+            if (msg.code) {
+              const pending = pendingGets.get(msg.code.toUpperCase());
+              if (pending) {
+                pending.resolve(msg.room || null);
+                pendingGets.delete(msg.code.toUpperCase());
+              }
+            }
+            if (msg.room) {
+              writeRoom(msg.room);
+              window.dispatchEvent(new CustomEvent("sv-room-local", { detail: msg.room }));
             }
           }
-          if (msg.room) {
-            writeRoom(msg.room);
-            window.dispatchEvent(new CustomEvent("sv-room-local", { detail: msg.room }));
-          }
-        }
-      });
-      ws.addEventListener("close", () => {
-        if (useGame.getState().ws === ws) useGame.setState({ ws: null });
-      });
-    } catch (e) {}
+        });
+        ws.addEventListener("close", () => {
+          if (useGame.getState().ws === ws) useGame.setState({ ws: null });
+          if (!disposed) reconnectTimer = setTimeout(() => connectWs(opened ? attempt : attempt + 1), opened ? 1200 : 350);
+        });
+        ws.addEventListener("error", () => {
+          try {
+            ws.close();
+          } catch (e) {}
+        });
+      } catch (e) {
+        if (!disposed) reconnectTimer = setTimeout(() => connectWs(attempt + 1), 350);
+      }
+    };
+    connectWs();
 
     return () => {
+      disposed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      try {
+        useGame.getState().ws?.close();
+      } catch (e) {}
       channel.close();
       window.removeEventListener("sv-room-local", onLocal);
+      window.removeEventListener("sv-snack", onSnack);
     };
-  }, []);
+  }, [addSnack]);
 
   useEffect(() => {
     const code = new URLSearchParams(location.search).get("room");
@@ -797,10 +848,27 @@ function App() {
 
   useEffect(() => {
     if (!room) return undefined;
+    if (room.status === "countdown" && room.countdownEndsAt && now() >= room.countdownEndsAt) {
+      publish({
+        ...room,
+        status: "playing",
+        startedAt: now(),
+        countdownEndsAt: null,
+      });
+    }
     const interval = setInterval(() => {
       const state = useGame.getState();
       const current = state.room;
       if (!current?.players[player.id]) return;
+      if (current.status === "countdown" && current.countdownEndsAt && now() >= current.countdownEndsAt) {
+        state.publish({
+          ...current,
+          status: "playing",
+          startedAt: now(),
+          countdownEndsAt: null,
+        });
+        return;
+      }
       publish({
         ...current,
         players: {
@@ -811,6 +879,37 @@ function App() {
     }, 2500);
     return () => clearInterval(interval);
   }, [room?.code, player.id, publish]);
+
+  useEffect(() => {
+    if (theme && !themes[theme]) setTheme(LIGHT_THEME);
+  }, [theme, setTheme]);
+
+  useEffect(() => {
+    if (!room) {
+      prevRoomRef.current = null;
+      return;
+    }
+    const prev = prevRoomRef.current;
+    if (!prev || prev.code !== room.code) {
+      prevRoomRef.current = room;
+      return;
+    }
+    const prevPlayers = prev.players || {};
+    const players = room.players || {};
+    if (prev.status === "lobby" && room.status === "playing") addSnack("Match started");
+    if (!prev.pausedAt && room.pausedAt) addSnack("Game paused");
+    if (prev.pausedAt && !room.pausedAt) addSnack("Game resumed");
+    if (!prev.winnerId && room.winnerId && players[room.winnerId]) addSnack(`${players[room.winnerId].name} won the race`);
+    Object.values(players).forEach((p) => {
+      const old = prevPlayers[p.id];
+      if (old && !isPlayerOnline(old) && isPlayerOnline(p)) addSnack(`${p.name} reconnected`);
+      if (old && isPlayerOnline(old) && !isPlayerOnline(p)) addSnack(`${p.name} went offline`);
+      if (old && !old.ready && p.ready && room.status === "lobby") addSnack(`${p.name} is ready`);
+      if (old && old.status !== "lost" && p.status === "lost") addSnack(`${p.name} is out`);
+      if (old && !old.personalSolvedAt && p.personalSolvedAt && p.status === "continue") addSnack(`${p.name} solved in continue mode`);
+    });
+    prevRoomRef.current = room;
+  }, [room, addSnack]);
 
   useEffect(() => {
     const onKey = (event) => {
@@ -874,6 +973,7 @@ function App() {
       <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col px-4 py-4 sm:px-6 lg:px-8">
         <Header onHome={leaveRoom} />
         {room ? <Room /> : urlJoinPending ? <RoomLoading room={{ code: new URLSearchParams(location.search).get("room")?.toUpperCase() || "..." }} /> : <Home />}
+        <SnackbarStack items={snacks} />
       </div>
     </main>
   );
@@ -882,6 +982,8 @@ function App() {
 function Header({ onHome }) {
   const theme = useGame((s) => s.theme);
   const setTheme = useGame((s) => s.setTheme);
+  const toggleDarkMode = useGame((s) => s.toggleDarkMode);
+  const dark = theme === DARK_THEME;
   return (
     <header className="mb-4 flex items-center justify-between gap-3 border-b border-[var(--line)] pb-4">
       <button className="flex items-center gap-3 text-left" onClick={onHome} title="Go home">
@@ -903,18 +1005,21 @@ function Header({ onHome }) {
             <option key={name}>{name}</option>
           ))}
         </select>
-        <ThemeIcon />
+        <ThemeIcon dark={dark} onToggle={toggleDarkMode} />
       </div>
     </header>
   );
 }
 
-function ThemeIcon() {
-  const theme = useGame((s) => s.theme);
+function ThemeIcon({ dark, onToggle }) {
   return (
-    <div className="grid size-10 place-items-center rounded-md border border-[var(--line)] bg-[var(--panel)] text-[var(--muted)]">
-      {theme === "Cyberpunk" ? <Moon size={18} /> : <Sun size={18} />}
-    </div>
+    <button
+      className="grid size-10 place-items-center rounded-md border border-[var(--line)] bg-[var(--panel)] text-[var(--muted)]"
+      onClick={onToggle}
+      title={dark ? "Switch to light mode" : "Switch to dark mode"}
+    >
+      {dark ? <Moon size={18} /> : <Sun size={18} />}
+    </button>
   );
 }
 
@@ -1038,244 +1143,6 @@ function Metric({ label, value }) {
   );
 }
 
-function VoiceRoom({ room, player, children }) {
-  const speakerMuted = useGame((s) => s.speakerMuted);
-  const setVoiceConnected = useGame((s) => s.setVoiceConnected);
-  const setVoiceError = useGame((s) => s.setVoiceError);
-  const [voice, setVoice] = useState({ token: undefined, url: undefined, loading: true, error: "" });
-
-  const handleConnected = useCallback(() => {
-    setVoiceConnected(true);
-    setVoiceError("");
-  }, [setVoiceConnected, setVoiceError]);
-
-  const handleDisconnected = useCallback(() => {
-    setVoiceConnected(false);
-  }, [setVoiceConnected]);
-
-  const handleError = useCallback(
-    (error) => {
-      setVoiceError(error.message);
-      setVoiceConnected(false);
-    },
-    [setVoiceConnected, setVoiceError],
-  );
-
-  const handleMediaDeviceFailure = useCallback(
-    (error) => {
-      setVoiceError(error?.message || "Microphone permission was blocked");
-      setVoiceConnected(false);
-    },
-    [setVoiceConnected, setVoiceError],
-  );
-
-  useEffect(() => {
-    let cancelled = false;
-    const base = `${window.location.protocol === "https:" ? "https:" : "http:"}//${window.location.hostname}:5174`;
-    const params = new URLSearchParams({
-      room: room.code,
-      identity: player.id,
-      name: player.name,
-    });
-    setVoice({ token: undefined, url: undefined, loading: true, error: "" });
-    fetch(`${base}/voice-token?${params}`)
-      .then(async (response) => {
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(data.error || "voice_unavailable");
-        return data;
-      })
-      .then((data) => {
-        if (cancelled) return;
-        setVoice({ token: data.token, url: data.url, loading: false, error: "" });
-        setVoiceError("");
-      })
-      .catch((error) => {
-        if (cancelled) return;
-        setVoice({ token: undefined, url: undefined, loading: false, error: error.message || "voice_unavailable" });
-        setVoiceConnected(false);
-        setVoiceError(error.message || "voice_unavailable");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [room.code, player.id, player.name, setVoiceConnected, setVoiceError]);
-
-  if (!voice.token || !voice.url) {
-    return (
-      <>
-        {children}
-        <VoiceControls disabled error={voice.loading ? "Connecting voice..." : voice.error} />
-      </>
-    );
-  }
-
-  return (
-    <LiveKitRoom
-      token={voice.token}
-      serverUrl={voice.url}
-      connect
-      audio={false}
-      video={false}
-      onConnected={handleConnected}
-      onDisconnected={handleDisconnected}
-      onError={handleError}
-      onMediaDeviceFailure={handleMediaDeviceFailure}
-    >
-      <RoomAudioRenderer muted={speakerMuted} />
-      <StartAudio
-        label="Allow voice"
-        className="fixed bottom-20 right-4 z-40 rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 py-2 text-sm font-medium shadow-lg"
-      />
-      <VoiceBridge />
-      {children}
-      <VoiceControls />
-    </LiveKitRoom>
-  );
-}
-
-function VoiceBridge() {
-  const speakingParticipants = useSpeakingParticipants();
-  const { isMicrophoneEnabled } = useLocalParticipant();
-  const setVoiceSpeakingIds = useGame((s) => s.setVoiceSpeakingIds);
-  const setLocalAudioMuted = useGame((s) => s.setLocalAudioMuted);
-
-  useEffect(() => {
-    setVoiceSpeakingIds(speakingParticipants.map((participant) => participant.identity));
-  }, [speakingParticipants, setVoiceSpeakingIds]);
-
-  useEffect(() => {
-    setLocalAudioMuted(!isMicrophoneEnabled);
-  }, [isMicrophoneEnabled, setLocalAudioMuted]);
-
-  return null;
-}
-
-function VoiceControls({ disabled = false, error = "" }) {
-  if (disabled) return <VoiceControlsShell micDisabled speakerDisabled={false} error={error} />;
-  return <VoiceControlsLive />;
-}
-
-function VoiceControlsLive() {
-  const { isMicrophoneEnabled, lastMicrophoneError, localParticipant, microphoneTrack } = useLocalParticipant();
-  const speakerMuted = useGame((s) => s.speakerMuted);
-  const setSpeakerMuted = useGame((s) => s.setSpeakerMuted);
-  const setVoiceError = useGame((s) => s.setVoiceError);
-  const voiceConnected = useGame((s) => s.voiceConnected);
-  const voiceError = useGame((s) => s.voiceError);
-  const [micBusy, setMicBusy] = useState(false);
-  const micSupportError = microphoneSupportError();
-
-  const toggleMic = useCallback(async () => {
-    if (micSupportError) {
-      setVoiceError(micSupportError);
-      return;
-    }
-    const nextEnabled = !isMicrophoneEnabled;
-    setMicBusy(true);
-    try {
-      if (!nextEnabled) {
-        await localParticipant.setMicrophoneEnabled(false);
-        setVoiceError("");
-        return;
-      }
-
-      const existingPublication = localParticipant.getTrackPublication(Track.Source.Microphone);
-      if (existingPublication?.track) {
-        await existingPublication.track.unmute();
-        setVoiceError("");
-        return;
-      }
-
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: MICROPHONE_CONSTRAINTS });
-      const [mediaTrack] = stream.getAudioTracks();
-      if (!mediaTrack) {
-        stream.getTracks().forEach((track) => track.stop());
-        throw new Error("No microphone track was returned by the browser.");
-      }
-
-      let publication;
-      try {
-        publication = await localParticipant.publishTrack(mediaTrack, {
-          source: Track.Source.Microphone,
-        });
-      } catch (error) {
-        mediaTrack.stop();
-        throw error;
-      }
-
-      if (nextEnabled && !publication && !localParticipant.isMicrophoneEnabled) {
-        setVoiceError(localParticipant.lastMicrophoneError?.message || "Microphone did not publish. Check browser and OS microphone permissions.");
-        return;
-      }
-      setVoiceError("");
-    } catch (error) {
-      setVoiceError(error?.message || "Unable to enable microphone");
-    } finally {
-      setMicBusy(false);
-    }
-  }, [isMicrophoneEnabled, localParticipant, micSupportError, setVoiceError]);
-
-  useEffect(() => {
-    if (lastMicrophoneError) setVoiceError(lastMicrophoneError.message || "Unable to enable microphone");
-  }, [lastMicrophoneError, setVoiceError]);
-
-  return (
-    <VoiceControlsShell
-      connected={voiceConnected}
-      micMuted={!isMicrophoneEnabled || !microphoneTrack}
-      speakerMuted={speakerMuted}
-      micBusy={micBusy}
-      error={voiceError}
-      micDisabled={micBusy}
-      speakerDisabled={false}
-      onToggleMic={toggleMic}
-      onToggleSpeaker={() => setSpeakerMuted(!speakerMuted)}
-    />
-  );
-}
-
-function VoiceControlsShell({
-  connected = false,
-  micMuted = true,
-  speakerMuted = false,
-  micBusy = false,
-  micDisabled = false,
-  speakerDisabled = false,
-  error = "",
-  onToggleMic,
-  onToggleSpeaker,
-}) {
-  return (
-    <div className="fixed bottom-4 right-4 z-40 flex items-center gap-2 rounded-lg border border-[var(--line)] bg-[var(--panel)]/95 p-2 shadow-lg backdrop-blur">
-      {error ? (
-        <p className="absolute bottom-full right-0 mb-2 w-64 rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 py-2 text-xs text-[var(--text)] shadow-lg sm:hidden">
-          {voiceErrorLabel(error)}
-        </p>
-      ) : null}
-      <button
-        className={micMuted ? "icon-btn text-[var(--danger)]" : "icon-btn text-[var(--good)]"}
-        onClick={onToggleMic}
-        disabled={micDisabled || micBusy}
-        title={micMuted ? "Unmute microphone" : "Mute microphone"}
-      >
-        {micMuted ? <MicOff size={18} /> : <Mic size={18} />}
-      </button>
-      <button
-        className={speakerMuted ? "icon-btn text-[var(--danger)]" : "icon-btn"}
-        onClick={onToggleSpeaker}
-        disabled={speakerDisabled}
-        title={speakerMuted ? "Undeafen" : "Deafen"}
-      >
-        {speakerMuted ? <VolumeX size={18} /> : <Volume2 size={18} />}
-      </button>
-      <div className="hidden min-w-0 pr-1 text-left text-xs text-[var(--muted)] sm:block">
-        <p className="font-medium text-[var(--text)]">{connected ? "Voice connected" : "Voice offline"}</p>
-        {error ? <p className="max-w-48 truncate">{voiceErrorLabel(error)}</p> : null}
-      </div>
-    </div>
-  );
-}
-
 function Room() {
   const room = useGame((s) => s.room);
   const player = useGame((s) => s.player);
@@ -1305,7 +1172,8 @@ function Room() {
           mistakes: 0,
           progress: 0,
           finishedMs: null,
-          audioMuted: false,
+          personalSolvedAt: null,
+          personalSolvedDismissed: false,
           board: [...room.puzzle],
           notes: blankNotes(),
           lastSeen: now(),
@@ -1320,16 +1188,18 @@ function Room() {
   }
 
   return (
-    <VoiceRoom room={room} player={player}>
-      <div className="grid flex-1 gap-4 lg:grid-cols-[minmax(0,1fr)_330px]">
+    <div className="grid flex-1 gap-4 lg:grid-cols-[minmax(0,1fr)_330px]">
       <section className="min-w-0 space-y-4">
         {isLobby ? (
           <Lobby />
         ) : (
           <>
+            <CountdownOverlay />
             <Board />
             <NumberPad />
             <GameTopbar />
+            <ContinueSolvedDialog />
+            <WinnerChampionOverlay />
           </>
         )}
       </section>
@@ -1349,10 +1219,27 @@ function Room() {
             className="btn-secondary mt-4 w-full"
             onClick={async () => {
               const ok = await copyText(room.code);
-              if (!ok) console.warn("Copy failed");
+              if (!ok) {
+                window.dispatchEvent(new CustomEvent("sv-snack", { detail: { message: "Copy failed" } }));
+                return;
+              }
+              window.dispatchEvent(new CustomEvent("sv-snack", { detail: { message: "Room code copied" } }));
             }}
           >
             <Clipboard size={17} /> Copy Code
+          </button>
+          <button
+            className="btn-secondary mt-2 w-full"
+            onClick={async () => {
+              const ok = await copyText(`${window.location.origin}${window.location.pathname}?room=${room.code}`);
+              if (!ok) {
+                window.dispatchEvent(new CustomEvent("sv-snack", { detail: { message: "Copy failed" } }));
+                return;
+              }
+              window.dispatchEvent(new CustomEvent("sv-snack", { detail: { message: "Room link copied" } }));
+            }}
+          >
+            <Link2 size={17} /> Copy Room Link
           </button>
           <div className="mt-4 grid place-items-center rounded-md bg-white p-3">
             <QRCodeSVG value={`${window.location.origin}${window.location.pathname}?room=${room.code}`} size={128} />
@@ -1375,8 +1262,7 @@ function Room() {
         <PlayersPanel />
       </aside>
       <EndDialog />
-      </div>
-    </VoiceRoom>
+    </div>
   );
 }
 
@@ -1513,6 +1399,7 @@ function Board() {
                 sameNumber ? "same" : "",
                 wrongEntry ? "wrong" : "",
               ].join(" ")}
+              onPointerDown={(event) => event.preventDefault()}
               onClick={() => canEdit && setSelected(idx)}
               disabled={!canEdit}
             >
@@ -1574,6 +1461,7 @@ function NumberPad() {
             counts[n] >= 9 ? "number-done" : "",
             flash === n ? "number-flash" : "",
           ].join(" ")}
+          onPointerDown={(event) => event.preventDefault()}
           onClick={() => pushMove(n)}
           disabled={counts[n] >= 9}
         >
@@ -1589,7 +1477,6 @@ function PlayersPanel() {
   const room = useGame((s) => s.room);
   const viewingId = useGame((s) => s.viewingId);
   const setViewingId = useGame((s) => s.setViewingId);
-  const voiceSpeakingIds = useGame((s) => s.voiceSpeakingIds);
   const players = Object.values(room.players);
   return (
     <div className="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-4">
@@ -1600,20 +1487,18 @@ function PlayersPanel() {
       <div className="space-y-3">
         {players.map((p) => {
           const online = isPlayerOnline(p);
-          const isSpeaking = voiceSpeakingIds.includes(p.id);
           return (
             <button
               key={p.id}
-              className={`w-full rounded-md border p-3 text-left transition ${isSpeaking ? "speaking-card" : ""} ${viewingId === p.id ? "border-[var(--accent)] bg-[var(--soft)]" : "border-[var(--line)] bg-transparent"}`}
+              className={`w-full rounded-md border p-3 text-left transition ${viewingId === p.id ? "border-[var(--accent)] bg-[var(--soft)]" : "border-[var(--line)] bg-transparent"}`}
               onClick={() => setViewingId(p.id)}
             >
               <div className="mb-2 flex items-center justify-between gap-2">
                 <span className="flex items-center gap-2 font-medium">
-                  {isSpeaking ? <span className="voice-wave" aria-hidden="true" /> : p.status === "winner" ? <Crown size={16} className="text-[var(--gold)]" /> : <Eye size={16} className="text-[var(--muted)]" />}
+                  {p.status === "winner" ? <Crown size={16} className="text-[var(--gold)]" /> : <Eye size={16} className="text-[var(--muted)]" />}
                   {p.name}
                 </span>
                 <span className="flex items-center gap-2">
-                  {p.audioMuted ? <MicOff size={16} className="text-[var(--danger)]" /> : null}
                   {online ? <Wifi size={16} className="text-[var(--good)]" /> : <WifiOff size={16} className="text-[var(--muted)]" />}
                 </span>
               </div>
@@ -1623,7 +1508,7 @@ function PlayersPanel() {
               <div className="mt-2 flex justify-between text-xs text-[var(--muted)]">
                 <span>{p.progress}% complete</span>
                 <span className={p.status === "lost" || p.mistakes >= 3 ? "text-[var(--danger)]" : ""}>
-                  {Math.min(p.mistakes, 3)}/2 mistakes | {statusLabel(p)}
+                  {Math.min(p.mistakes, 3)}/3 mistakes | {statusLabel(p)}
                 </span>
               </div>
               {typeof p.finishedMs === "number" && (
@@ -1695,6 +1580,162 @@ function EndDialog() {
   );
 }
 
+function ContinueSolvedDialog() {
+  const room = useGame((s) => s.room);
+  const player = useGame((s) => s.player);
+  const publish = useGame((s) => s.publish);
+  const me = room.players[player.id];
+  const show = Boolean(room.status === "ended" && me.status === "continue" && me.personalSolvedAt && !me.personalSolvedDismissed);
+  if (!show) return null;
+  return (
+    <AnimatePresence>
+      <motion.div
+        className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4 backdrop-blur-sm"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+      >
+        <motion.div
+          className="w-full max-w-md rounded-lg border border-[var(--line)] bg-[var(--panel)] p-6 text-center shadow-2xl"
+          initial={{ scale: 0.92, y: 14 }}
+          animate={{ scale: 1, y: 0 }}
+        >
+          <Check className="mx-auto mb-3 text-[var(--good)]" size={42} />
+          <h2 className="text-2xl font-semibold tracking-normal">Board completed</h2>
+          <p className="mt-2 text-[var(--muted)]">
+            You solved your board in continue mode at {formatTime(me.personalSolvedAt)}.
+          </p>
+          <button
+            className="btn-primary mt-5 w-full"
+            onClick={() =>
+              publish({
+                ...room,
+                players: {
+                  ...room.players,
+                  [player.id]: { ...me, personalSolvedDismissed: true, lastSeen: now() },
+                },
+              })
+            }
+          >
+            Nice
+          </button>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+
+function CountdownOverlay() {
+  const room = useGame((s) => s.room);
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (room.status !== "countdown") return undefined;
+    const timer = setInterval(() => setTick((v) => v + 1), 100);
+    return () => clearInterval(timer);
+  }, [room.status]);
+  if (room.status !== "countdown") return null;
+  const leftMs = Math.max(0, (room.countdownEndsAt || 0) - now());
+  const count = Math.max(1, Math.ceil(leftMs / 1000));
+  void tick;
+  return (
+    <div className="fixed inset-0 z-40 grid place-items-center bg-black/35 backdrop-blur-sm">
+      <motion.div
+        className="rounded-2xl border border-[var(--line)] bg-[var(--panel)] px-8 py-6 text-center shadow-2xl"
+        key={count}
+        initial={{ scale: 0.76, opacity: 0.45 }}
+        animate={{ scale: 1, opacity: 1 }}
+      >
+        <p className="text-sm text-[var(--muted)]">Game starts in</p>
+        <p className="mt-2 text-5xl font-semibold leading-none">{count}</p>
+      </motion.div>
+    </div>
+  );
+}
+
+function WinnerChampionOverlay() {
+  const room = useGame((s) => s.room);
+  const player = useGame((s) => s.player);
+  const me = room.players[player.id];
+  const [show, setShow] = useState(false);
+  const [closedManually, setClosedManually] = useState(false);
+  const shownWinRef = React.useRef("");
+  useEffect(() => {
+    if (room?.winnerId !== player.id) return;
+    if (shownWinRef.current === `${room.code}:${room.winnerId}`) return;
+    shownWinRef.current = `${room.code}:${room.winnerId}`;
+    setClosedManually(false);
+    setShow(true);
+    const timer = setTimeout(() => setShow(false), 3600);
+    return () => clearTimeout(timer);
+  }, [room?.code, room?.winnerId, player.id]);
+  if (!show || closedManually) return null;
+  return (
+    <AnimatePresence>
+      <motion.div className="fixed inset-0 z-[90] overflow-hidden" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+        <motion.div className="absolute inset-0 bg-[var(--veil)]" initial={{ opacity: 0 }} animate={{ opacity: 0.9 }} />
+        {Array.from({ length: 24 }).map((_, i) => (
+          <motion.span
+            key={i}
+            className="absolute block h-2 w-2 rounded-full bg-[var(--gold)]"
+            initial={{ x: "50vw", y: "42vh", opacity: 0 }}
+            animate={{
+              x: `calc(50vw + ${Math.cos((i / 24) * Math.PI * 2) * (180 + (i % 4) * 36)}px)`,
+              y: `calc(42vh + ${Math.sin((i / 24) * Math.PI * 2) * (150 + (i % 5) * 32)}px)`,
+              opacity: [0, 1, 0],
+              scale: [0.7, 1.4, 0.8],
+            }}
+            transition={{ duration: 1.9, ease: "easeOut", delay: 0.08 + (i % 6) * 0.03 }}
+          />
+        ))}
+        <div className="absolute inset-0 grid place-items-center">
+          <motion.div className="relative pointer-events-auto" initial={{ scale: 0.55, rotate: -10 }} animate={{ scale: 1.12, rotate: 0 }} transition={{ type: "spring", stiffness: 240, damping: 12 }}>
+            <button
+              className="pointer-events-auto absolute right-4 top-4 grid size-9 place-items-center rounded-md border border-[var(--line)] bg-[var(--panel)]"
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setClosedManually(true);
+                setShow(false);
+              }}
+              title="Close"
+            >
+              <X size={16} />
+            </button>
+            <Crown size={108} className="mx-auto text-[var(--gold)] drop-shadow-[0_0_28px_rgba(202,138,4,0.55)]" />
+            <motion.p className="mt-3 text-center text-4xl font-semibold text-[var(--text)]" initial={{ y: 16, opacity: 0 }} animate={{ y: 0, opacity: 1 }}>
+              Winner
+            </motion.p>
+            <motion.p className="mt-1 text-center text-sm text-[var(--muted)]" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.25 }}>
+              {me?.name || "Winner"} solved first
+            </motion.p>
+          </motion.div>
+        </div>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+
+function SnackbarStack({ items }) {
+  if (!items.length) return null;
+  return (
+    <div className="pointer-events-none fixed bottom-4 left-1/2 z-50 flex w-full max-w-xl -translate-x-1/2 flex-col gap-2 px-4">
+      <AnimatePresence>
+        {items.map((item) => (
+          <motion.div
+            key={item.id}
+            initial={{ opacity: 0, y: 18, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 18, scale: 0.98 }}
+            className="rounded-md border border-[var(--line)] bg-[var(--panel)] px-4 py-3 text-sm shadow-lg"
+          >
+            {item.text}
+          </motion.div>
+        ))}
+      </AnimatePresence>
+    </div>
+  );
+}
+
 function elapsed(room) {
   if (!room.startedAt) return 0;
   const end = room.pausedAt || now();
@@ -1713,13 +1754,6 @@ function statusLabel(player) {
   if (player.status === "continue" && player.mistakes >= 3) return "lost | continue mode";
   if (player.status === "spectating") return "spectating";
   return player.status;
-}
-
-function voiceErrorLabel(error) {
-  if (!error) return "";
-  if (error === "livekit_not_configured") return "Set LiveKit env vars";
-  if (error === "voice_unavailable") return "Voice unavailable";
-  return error.replaceAll("_", " ");
 }
 
 export default App;
