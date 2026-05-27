@@ -18,7 +18,7 @@ export const themes = {
   Sepia: "theme-sepia",
 };
 
-const blankNotes = () => Array.from({ length: 81 }, () => []);
+export const blankNotes = () => Array.from({ length: 81 }, () => []);
 export const now = () => Date.now();
 const ONLINE_GRACE_MS = 15000;
 export const EMPTY_ROOM_TTL_MS = 180000;
@@ -303,11 +303,13 @@ export const useGame = create((set, get) => ({
           finishedMs: null,
           personalSolvedAt: null,
           personalSolvedDismissed: false,
+          hintsUsed: 0,
           board: [...puzzle.puzzle],
           notes: blankNotes(),
           lastSeen: now(),
         },
       },
+      rematchRequests: {},
     };
     get().publish(room);
     set({ viewingId: player.id, selected: null, history: [] });
@@ -320,7 +322,7 @@ export const useGame = create((set, get) => ({
     const player = get().player;
     const players = {
       ...room.players,
-      [player.id]: { ...room.players[player.id], ready: true, connected: true },
+          [player.id]: { ...room.players[player.id], ready: true, connected: true },
     };
     const started = { ...room, players, status: "playing", startedAt: now() };
     get().publish(started);
@@ -347,6 +349,7 @@ export const useGame = create((set, get) => ({
             finishedMs: null,
             personalSolvedAt: null,
             personalSolvedDismissed: false,
+            hintsUsed: 0,
             board: [...found.puzzle],
             notes: blankNotes(),
             lastSeen: now(),
@@ -395,6 +398,7 @@ export const useGame = create((set, get) => ({
             finishedMs: null,
             personalSolvedAt: null,
             personalSolvedDismissed: false,
+            hintsUsed: 0,
             board: [...roomData.puzzle],
             notes: blankNotes(),
             lastSeen: now(),
@@ -426,14 +430,21 @@ export const useGame = create((set, get) => ({
     const { room, player, publish } = get();
     const me = room?.players?.[player.id];
     if (!room || !me) return;
+    const playerCount = Object.keys(room.players || {}).length;
     const players = { ...room.players, [player.id]: { ...me, ready: !me.ready } };
     const allReady = Object.values(players).length > 0 && Object.values(players).every((p) => p.ready);
+    const canStart = allReady && playerCount >= 2;
+    if (allReady && !canStart) {
+      window.dispatchEvent(
+        new CustomEvent("sv-snack", { detail: { message: "At least 2 players are needed to start room play." } }),
+      );
+    }
     publish({
       ...room,
       players,
-      status: allReady ? "countdown" : "lobby",
-      countdownEndsAt: allReady ? now() + 3000 : null,
-      startedAt: allReady ? null : room.startedAt,
+      status: canStart ? "countdown" : "lobby",
+      countdownEndsAt: canStart ? now() + 3000 : null,
+      startedAt: canStart ? null : room.startedAt,
     });
   },
   setSelected: (selected) => set({ selected }),
@@ -515,6 +526,106 @@ export const useGame = create((set, get) => ({
       },
     });
     set({ viewingId: targetId });
+  },
+  useHint: () => {
+    const { room, player, selected, publish, history } = get();
+    const me = room?.players?.[player.id];
+    if (!room || !me) return;
+    if (selected === null || room.puzzle[selected] || room.pausedAt) return;
+    if (me.status === "spectating" || me.status === "lost") return;
+    if (get().viewingId && get().viewingId !== player.id) return;
+    if (room.status === "countdown") return;
+    if (room.status === "ended" && me.status !== "continue") return;
+    if ((me.hintsUsed || 0) >= 2) {
+      window.dispatchEvent(new CustomEvent("sv-snack", { detail: { message: "You already used 2 hints on this board." } }));
+      return;
+    }
+    if (me.board[selected] === room.solution[selected]) {
+      window.dispatchEvent(new CustomEvent("sv-snack", { detail: { message: "Selected cell is already correct." } }));
+      return;
+    }
+
+    const snapshot = {
+      board: [...me.board],
+      notes: me.notes.map((n) => [...n]),
+    };
+    const board = [...me.board];
+    const notes = me.notes.map((n) => [...n]);
+    const digit = room.solution[selected];
+    board[selected] = digit;
+    notes[selected] = [];
+    cellPeers(selected).forEach((idx) => {
+      notes[idx] = notes[idx].filter((n) => n !== digit);
+    });
+    const progress = Math.round((board.filter(Boolean).length / 81) * 100);
+    publish({
+      ...room,
+      players: {
+        ...room.players,
+        [player.id]: {
+          ...me,
+          board,
+          notes,
+          hintsUsed: (me.hintsUsed || 0) + 1,
+          progress,
+          lastSeen: now(),
+        },
+      },
+    });
+    set({ history: [...history, snapshot].slice(-120) });
+  },
+  toggleRematchVote: () => {
+    const { room, player, publish } = get();
+    const me = room?.players?.[player.id];
+    if (!room || !me || room.status !== "ended") return;
+    const voterIds = Object.values(room.players || {})
+      .filter((p) => isPlayerOnline(p))
+      .map((p) => p.id);
+    if (voterIds.length === 0) return;
+    const rematchRequests = { ...(room.rematchRequests || {}) };
+    rematchRequests[player.id] = !rematchRequests[player.id];
+    const unanimous = voterIds.every((id) => rematchRequests[id]);
+    if (!unanimous) {
+      publish({ ...room, rematchRequests });
+      return;
+    }
+    const puzzle = generateSudoku(room.difficulty);
+    const players = Object.fromEntries(
+      Object.entries(room.players).map(([id, p]) => [
+        id,
+        {
+          ...p,
+          ready: false,
+          status: "active",
+          mistakes: 0,
+          progress: 0,
+          finishedMs: null,
+          personalSolvedAt: null,
+          personalSolvedDismissed: false,
+          lossPromptDismissed: true,
+          hintsUsed: 0,
+          board: [...puzzle.puzzle],
+          notes: blankNotes(),
+          lastSeen: now(),
+        },
+      ]),
+    );
+    publish({
+      ...room,
+      ...puzzle,
+      status: "countdown",
+      countdownEndsAt: now() + 3000,
+      startedAt: null,
+      totalPausedMs: 0,
+      pausedAt: null,
+      pauseRequests: {},
+      resumeRequests: {},
+      pausedByIds: [],
+      winnerId: null,
+      players,
+      rematchRequests: {},
+    });
+    set({ history: [], selected: null, viewingId: player.id });
   },
   pushMove: (digit) => {
     const { room, player, selected, inputMode, publish, history, saveStats, countPlaced } = get();

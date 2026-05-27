@@ -4,6 +4,7 @@ import {
   Check,
   Clipboard,
   Link2,
+  Lightbulb,
   Crown,
   LogOut,
   Eye,
@@ -29,6 +30,7 @@ import {
   LIGHT_THEME,
   copyText,
   difficulties,
+  blankNotes,
   getPauseVoterIds,
   isPlayerOnline,
   mergeRoomPresence,
@@ -257,6 +259,7 @@ function App() {
     const prevPlayers = prev.players || {};
     const players = room.players || {};
     if (prev.status === "lobby" && room.status === "playing") addSnack("Match started");
+    if (prev.status === "ended" && room.status === "countdown") addSnack("Rematch accepted. New board starts in 3 seconds");
     if (!prev.pausedAt && room.pausedAt) addSnack("Game paused");
     if (prev.pausedAt && !room.pausedAt) addSnack("Game resumed");
     if (!prev.winnerId && room.winnerId && players[room.winnerId]) addSnack(`${players[room.winnerId].name} won the race`);
@@ -674,6 +677,7 @@ function GameTopbar() {
   const togglePause = useGame((s) => s.togglePause);
   const undo = useGame((s) => s.undo);
   const erase = useGame((s) => s.erase);
+  const useHint = useGame((s) => s.useHint);
   const [, setTick] = useState(0);
   const me = room.players[player.id];
   const isPaused = Boolean(room.pausedAt);
@@ -708,6 +712,9 @@ function GameTopbar() {
           onClick={() => setInputMode(inputMode === "value" ? "note" : "value")}
         >
           <Pencil size={17} /> {inputMode === "note" ? "Notes" : "Values"}
+        </button>
+        <button className="btn-secondary" onClick={useHint} title="Hint">
+          <Lightbulb size={17} /> Hint {Math.max(0, 2 - (me.hintsUsed || 0))}
         </button>
         <button className={voted ? "btn-primary" : "btn-secondary"} onClick={togglePause}>
           {isPaused ? <Play size={17} /> : <Pause size={17} />} {isPaused ? "Resume" : "Pause"} {voteCount}
@@ -889,8 +896,13 @@ function EndDialog() {
   const player = useGame((s) => s.player);
   const continueMode = useGame((s) => s.continueMode);
   const spectateAfterLoss = useGame((s) => s.spectateAfterLoss);
+  const toggleRematchVote = useGame((s) => s.toggleRematchVote);
   const me = room.players[player.id];
   const winner = room.winnerId ? room.players[room.winnerId] : null;
+  const rematchRequests = room.rematchRequests || {};
+  const rematchVoterIds = Object.values(room.players).filter((p) => isPlayerOnline(p)).map((p) => p.id);
+  const rematchVotes = rematchVoterIds.filter((id) => rematchRequests[id]).length;
+  const votedRematch = Boolean(rematchRequests[player.id]);
   const show = room.status === "ended" && me.status !== "continue";
   const lostByMistakes = me.status === "lost" && !me.lossPromptDismissed;
 
@@ -929,9 +941,14 @@ function EndDialog() {
                 </button>
               </div>
             ) : (
-              <button className="btn-primary mt-5 w-full" onClick={continueMode}>
-                <Play size={18} /> Continue Mode
-              </button>
+              <div className="mt-5 grid gap-2">
+                <button className="btn-primary w-full" onClick={continueMode}>
+                  <Play size={18} /> Continue Mode
+                </button>
+                <button className={votedRematch ? "btn-primary w-full" : "btn-secondary w-full"} onClick={toggleRematchVote}>
+                  <RotateCcw size={18} /> Rematch {rematchVotes}/{rematchVoterIds.length}
+                </button>
+              </div>
             )}
           </motion.div>
         </motion.div>
