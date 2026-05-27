@@ -52,16 +52,19 @@ function App() {
   const leaveRoom = useGame((s) => s.leaveRoom);
   const setTheme = useGame((s) => s.setTheme);
   const ws = useGame((s) => s.ws);
-  const [snacks, setSnacks] = useState([]);
+  const [activeSnack, setActiveSnack] = useState(null);
   const prevRoomRef = React.useRef(null);
   const [urlJoinPending, setUrlJoinPending] = useState(() => Boolean(new URLSearchParams(location.search).get("room")));
   const addSnack = useCallback((text) => {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    setSnacks((items) => [...items, { id, text }].slice(-5));
-    setTimeout(() => {
-      setSnacks((items) => items.filter((item) => item.id !== id));
-    }, 2800);
+    setActiveSnack({ id, text });
   }, []);
+
+  useEffect(() => {
+    if (!activeSnack) return undefined;
+    const timer = setTimeout(() => setActiveSnack(null), 2600);
+    return () => clearTimeout(timer);
+  }, [activeSnack?.id]);
 
   useEffect(() => {
     const channel = new BroadcastChannel("sudoku-versus");
@@ -276,6 +279,13 @@ function App() {
 
   useEffect(() => {
     const onKey = (event) => {
+      const tag = (event.target?.tagName || "").toLowerCase();
+      const isTypingTarget =
+        tag === "input" ||
+        tag === "textarea" ||
+        tag === "select" ||
+        event.target?.isContentEditable;
+      if (isTypingTarget) return;
       if (!useGame.getState().room) return;
       if (event.key.startsWith("Arrow")) {
         const state = useGame.getState();
@@ -298,7 +308,13 @@ function App() {
         useGame.getState().setSelected(next);
         return;
       }
-      if (/^[1-9]$/.test(event.key)) useGame.getState().pushMove(Number(event.key));
+      const digitFromKey = /^[1-9]$/.test(event.key)
+        ? Number(event.key)
+        : (/^(Digit|Numpad)[1-9]$/.test(event.code) ? Number(event.code.slice(-1)) : null);
+      if (digitFromKey) {
+        useGame.getState().pushMove(digitFromKey);
+        return;
+      }
       if (event.key === "Backspace" || event.key === "Delete") useGame.getState().erase();
       if (event.key.toLowerCase() === "z" && (event.metaKey || event.ctrlKey)) useGame.getState().undo();
       if (event.code === "Space") {
@@ -336,7 +352,7 @@ function App() {
       <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col px-4 py-4 sm:px-6 lg:px-8">
         <Header onHome={leaveRoom} />
         {room ? <Room /> : urlJoinPending ? <RoomLoading room={{ code: new URLSearchParams(location.search).get("room")?.toUpperCase() || "..." }} /> : <Home />}
-        <SnackbarStack items={snacks} />
+        <SnackbarStack item={activeSnack} onClose={() => setActiveSnack(null)} />
       </div>
     </main>
   );
@@ -458,6 +474,13 @@ function Home() {
 }
 
 function StatsPanel({ stats }) {
+  const history = stats.mistakeHistory || [];
+  const recent = history.slice(-12);
+  const avgMistakes = history.length
+    ? (history.reduce((sum, val) => sum + val, 0) / history.length).toFixed(1)
+    : "0.0";
+  const cleanRuns = history.filter((m) => m === 0).length;
+  const maxMistakes = history.length ? Math.max(...history) : 0;
   return (
     <aside className="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-5">
       <div className="mb-5 flex items-center gap-2">
@@ -469,6 +492,8 @@ function StatsPanel({ stats }) {
         <Metric label="Wins" value={stats.wins} />
         <Metric label="Losses" value={stats.losses} />
         <Metric label="Win Rate" value={`${stats.played ? Math.round((stats.wins / stats.played) * 100) : 0}%`} />
+        <Metric label="Avg Mistakes" value={avgMistakes} />
+        <Metric label="Clean Runs" value={cleanRuns} />
       </div>
       <div className="mt-5">
         <p className="mb-2 text-sm font-medium text-[var(--muted)]">Best Times</p>
@@ -482,16 +507,23 @@ function StatsPanel({ stats }) {
         </div>
       </div>
       <div className="mt-5">
-        <p className="mb-2 text-sm font-medium text-[var(--muted)]">Mistake History</p>
-        <div className="flex h-16 items-end gap-1">
-          {(stats.mistakeHistory.length ? stats.mistakeHistory : [0]).map((mistakes, idx) => (
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <p className="text-sm font-medium text-[var(--muted)]">Mistake History (last 12)</p>
+          <p className="text-xs text-[var(--muted)]">Max: {maxMistakes}</p>
+        </div>
+        <div className="grid grid-cols-12 items-end gap-1 rounded-md border border-[var(--line)] bg-[var(--soft)] p-2">
+          {(recent.length ? recent : [0]).map((mistakes, idx) => (
             <div
               key={`${mistakes}-${idx}`}
-              className="w-full rounded-sm bg-[var(--accent)] opacity-80"
-              style={{ height: `${Math.max(8, mistakes * 20)}px` }}
+              title={`Match ${idx + 1}: ${mistakes} mistakes`}
+              className={mistakes >= 3 ? "w-full rounded-sm bg-[var(--danger)] opacity-90" : "w-full rounded-sm bg-[var(--accent)] opacity-85"}
+              style={{ height: `${Math.max(10, mistakes * 14)}px` }}
             />
           ))}
         </div>
+        <p className="mt-2 text-xs text-[var(--muted)]">
+          Bar height = mistakes in each recent match. Red bars indicate 3 or more mistakes.
+        </p>
       </div>
     </aside>
   );
@@ -512,6 +544,7 @@ function Room() {
   const setPlayerName = useGame((s) => s.setPlayerName);
   const publish = useGame((s) => s.publish);
   const leaveRoom = useGame((s) => s.leaveRoom);
+  const kickPlayer = useGame((s) => s.kickPlayer);
   const [nameDraft, setNameDraft] = useState(player.name || "");
   const me = room.players?.[player.id];
   const activePlayers = Object.values(room.players || {}).filter((p) => p.status === "active");
@@ -522,7 +555,16 @@ function Room() {
   }, [player.name]);
 
   useEffect(() => {
+    if (room?.kickedIds?.[player.id]) {
+      window.dispatchEvent(new CustomEvent("sv-snack", { detail: { message: "You were removed from the room by the owner." } }));
+      leaveRoom({ historyMode: "replace" });
+      return;
+    }
+  }, [room?.kickedIds, room, player.id, leaveRoom]);
+
+  useEffect(() => {
     if (!room || room.players?.[player.id]) return;
+    if (room.kickedIds?.[player.id]) return;
     const repaired = {
       ...room,
       players: {
@@ -566,8 +608,8 @@ function Room() {
           </>
         )}
       </section>
-      <aside className="space-y-4">
-        <div className="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-4">
+      <aside className="flex flex-col gap-4">
+        <div className="order-2 rounded-lg border border-[var(--line)] bg-[var(--panel)] p-4 lg:order-1">
           <div className="flex items-start justify-between gap-3">
             <div>
               <p className="text-sm text-[var(--muted)]">Room</p>
@@ -621,8 +663,30 @@ function Room() {
               </button>
             </div>
           </div>
+          {isLobby && room.ownerId === player.id && (
+            <div className="mt-4 rounded-md border border-[var(--line)] bg-[var(--soft)] p-3">
+              <p className="mb-2 text-xs font-medium text-[var(--muted)]">Owner Controls</p>
+              <div className="space-y-2">
+                {Object.values(room.players)
+                  .filter((p) => p.id !== player.id)
+                  .map((p) => (
+                    <div key={p.id} className="flex items-center justify-between gap-2 rounded-md bg-[var(--panel)] px-3 py-2">
+                      <span className="text-sm">{p.name}</span>
+                      <button className="btn-secondary h-9 px-3" onClick={() => kickPlayer(p.id)}>
+                        Kick
+                      </button>
+                    </div>
+                  ))}
+                {Object.keys(room.players).length <= 1 && (
+                  <p className="text-xs text-[var(--muted)]">No other players to remove.</p>
+                )}
+              </div>
+            </div>
+          )}
         </div>
-        <PlayersPanel />
+        <div className="order-1 lg:order-2">
+          <PlayersPanel />
+        </div>
       </aside>
       <EndDialog />
     </div>
@@ -678,10 +742,15 @@ function GameTopbar() {
   const undo = useGame((s) => s.undo);
   const erase = useGame((s) => s.erase);
   const useHint = useGame((s) => s.useHint);
+  const toggleRematchVote = useGame((s) => s.toggleRematchVote);
   const [, setTick] = useState(0);
   const me = room.players[player.id];
   const isPaused = Boolean(room.pausedAt);
   const voteMap = isPaused ? (room.resumeRequests || {}) : (room.pauseRequests || {});
+  const rematchRequests = room.rematchRequests || {};
+  const rematchVoterIds = Object.values(room.players).filter((p) => isPlayerOnline(p)).map((p) => p.id);
+  const rematchVotes = rematchVoterIds.filter((id) => rematchRequests[id]).length;
+  const votedRematch = Boolean(rematchRequests[player.id]);
   const voted = Boolean(voteMap[player.id]);
   const voteBaseIds = isPaused
     ? ((room.pausedByIds && room.pausedByIds.length > 0)
@@ -718,6 +787,9 @@ function GameTopbar() {
         </button>
         <button className={voted ? "btn-primary" : "btn-secondary"} onClick={togglePause}>
           {isPaused ? <Play size={17} /> : <Pause size={17} />} {isPaused ? "Resume" : "Pause"} {voteCount}
+        </button>
+        <button className={votedRematch ? "btn-primary" : "btn-secondary"} onClick={toggleRematchVote}>
+          <RotateCcw size={17} /> Rematch {rematchVotes}/{rematchVoterIds.length}
         </button>
       </div>
       <div className="text-right">
@@ -1092,22 +1164,27 @@ function WinnerChampionOverlay() {
   );
 }
 
-function SnackbarStack({ items }) {
-  if (!items.length) return null;
+function SnackbarStack({ item, onClose }) {
+  if (!item) return null;
   return (
     <div className="pointer-events-none fixed bottom-4 left-1/2 z-50 flex w-full max-w-xl -translate-x-1/2 flex-col gap-2 px-4">
       <AnimatePresence>
-        {items.map((item) => (
-          <motion.div
-            key={item.id}
-            initial={{ opacity: 0, y: 18, scale: 0.98 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 18, scale: 0.98 }}
-            className="rounded-md border border-[var(--line)] bg-[var(--panel)] px-4 py-3 text-sm shadow-lg"
+        <motion.div
+          key={item.id}
+          initial={{ opacity: 0, y: 18, scale: 0.98 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: 18, scale: 0.98 }}
+          className="pointer-events-auto flex items-center justify-between gap-3 rounded-md border border-[var(--line)] bg-[var(--panel)] px-4 py-3 text-sm shadow-lg"
+        >
+          <span>{item.text}</span>
+          <button
+            className="grid size-7 place-items-center rounded-md border border-[var(--line)] bg-[var(--soft)]"
+            onClick={onClose}
+            title="Close notification"
           >
-            {item.text}
-          </motion.div>
-        ))}
+            <X size={14} />
+          </button>
+        </motion.div>
       </AnimatePresence>
     </div>
   );

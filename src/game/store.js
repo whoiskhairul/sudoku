@@ -42,9 +42,11 @@ export const mergeRoomPresence = (currentRoom, nextRoom) => {
   if (!currentRoom || !nextRoom || currentRoom.code !== nextRoom.code) return nextRoom;
   const currentPlayers = currentRoom.players || {};
   const incomingPlayers = nextRoom.players || {};
+  const kickedIds = { ...(currentRoom.kickedIds || {}), ...(nextRoom.kickedIds || {}) };
   const mergedPlayers = {};
   const playerIds = new Set([...Object.keys(currentPlayers), ...Object.keys(incomingPlayers)]);
   playerIds.forEach((id) => {
+    if (kickedIds[id]) return;
     const prev = currentPlayers[id];
     const incoming = incomingPlayers[id];
     if (!prev && incoming) {
@@ -52,6 +54,7 @@ export const mergeRoomPresence = (currentRoom, nextRoom) => {
       return;
     }
     if (prev && !incoming) {
+      if (nextRoom?.kickedIds?.[id]) return;
       mergedPlayers[id] = prev;
       return;
     }
@@ -282,6 +285,7 @@ export const useGame = create((set, get) => ({
     const room = {
       code,
       difficulty,
+      ownerId: player.id,
       ...puzzle,
       status: "lobby",
       createdAt: now(),
@@ -445,6 +449,7 @@ export const useGame = create((set, get) => ({
       status: canStart ? "countdown" : "lobby",
       countdownEndsAt: canStart ? now() + 3000 : null,
       startedAt: canStart ? null : room.startedAt,
+      rematchRequests: {},
     });
   },
   setSelected: (selected) => set({ selected }),
@@ -577,7 +582,7 @@ export const useGame = create((set, get) => ({
   toggleRematchVote: () => {
     const { room, player, publish } = get();
     const me = room?.players?.[player.id];
-    if (!room || !me || room.status !== "ended") return;
+    if (!room || !me) return;
     const voterIds = Object.values(room.players || {})
       .filter((p) => isPlayerOnline(p))
       .map((p) => p.id);
@@ -626,6 +631,33 @@ export const useGame = create((set, get) => ({
       rematchRequests: {},
     });
     set({ history: [], selected: null, viewingId: player.id });
+  },
+  kickPlayer: (targetId) => {
+    const { room, player, publish } = get();
+    if (!room || !targetId || targetId === player.id) return;
+    if (room.ownerId !== player.id) return;
+    if (!room.players?.[targetId]) return;
+    const players = { ...room.players };
+    delete players[targetId];
+    const pauseRequests = { ...(room.pauseRequests || {}) };
+    const resumeRequests = { ...(room.resumeRequests || {}) };
+    const rematchRequests = { ...(room.rematchRequests || {}) };
+    delete pauseRequests[targetId];
+    delete resumeRequests[targetId];
+    delete rematchRequests[targetId];
+    const kickedIds = { ...(room.kickedIds || {}), [targetId]: now() };
+    const canContinueCountdown = Object.values(players).length >= 2;
+    publish({
+      ...room,
+      players,
+      pauseRequests,
+      resumeRequests,
+      rematchRequests,
+      kickedIds,
+      status: room.status === "countdown" && !canContinueCountdown ? "lobby" : room.status,
+      countdownEndsAt: room.status === "countdown" && !canContinueCountdown ? null : room.countdownEndsAt,
+      startedAt: room.status === "countdown" && !canContinueCountdown ? null : room.startedAt,
+    });
   },
   pushMove: (digit) => {
     const { room, player, selected, inputMode, publish, history, saveStats, countPlaced } = get();
@@ -694,7 +726,7 @@ export const useGame = create((set, get) => ({
         losses: get().stats.losses + 1,
         mistakeHistory: [...get().stats.mistakeHistory.slice(-19), mistakes],
       });
-    } else if (winnerId && solved && status === "continue" && !personalSolvedAt) {
+    } else if (solved && status === "continue" && !personalSolvedAt) {
       personalSolvedAt = room.startedAt ? now() - room.startedAt - room.totalPausedMs : 0;
       personalSolvedDismissed = false;
     }
