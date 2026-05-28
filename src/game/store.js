@@ -44,6 +44,21 @@ export const parseDateKey = (dateKey) => {
   if (Number.isNaN(date.getTime())) return null;
   return date;
 };
+export const isPastDateKey = (dateKey) => {
+  const date = parseDateKey(dateKey);
+  if (!date) return false;
+  const today = new Date();
+  const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  return date.getTime() < todayStart.getTime();
+};
+export const isFutureDateKey = (dateKey) => {
+  const date = parseDateKey(dateKey);
+  if (!date) return true;
+  const today = new Date();
+  const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  return date.getTime() > todayStart.getTime();
+};
+export const isTodayOrPastDateKey = (dateKey) => !isFutureDateKey(dateKey);
 export const dailyDifficultyForDate = (dateKey) => {
   const date = parseDateKey(dateKey);
   if (!date) return "Medium";
@@ -539,6 +554,7 @@ export const useGame = create((set, get) => ({
     });
   },
   openDailyBoard: (dateKey) => {
+    if (!isTodayOrPastDateKey(dateKey)) return;
     const board = get().getDailyBoard(dateKey);
     const progress = get().dailyProgress[board.dateKey];
     const snapshot = progress?.lastBoardSnapshot;

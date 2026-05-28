@@ -40,6 +40,7 @@ import {
   readJSON,
   toDateKey,
   parseDateKey,
+  isFutureDateKey,
   themes,
   useGame,
   writeRoom,
@@ -591,6 +592,7 @@ function Home() {
               return (
                 <button
                   key={key}
+                  disabled={isFutureDateKey(key)}
                   className={`relative h-11 rounded-md border text-sm ${selected ? "border-[var(--accent)] bg-[var(--soft)]" : "border-[var(--line)] bg-[var(--panel)]"} ${status === "solved" ? "ring-1 ring-[var(--good)]/50" : ""}`}
                   onClick={() => setSelectedDate(key)}
                   title={`${key} - ${status}`}
@@ -614,7 +616,7 @@ function Home() {
               </span>
               <span className="ml-3 text-sm text-[var(--muted)]">({dailyMeta.difficulty}, {selectedProgress?.status || "not_started"})</span>
             </p>
-            <button className="btn-primary" onClick={() => openDailyBoard(selectedDate)}>
+            <button className="btn-primary" onClick={() => openDailyBoard(selectedDate)} disabled={isFutureDateKey(selectedDate)}>
               <Play size={18} /> Play Day
             </button>
           </div>
