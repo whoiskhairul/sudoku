@@ -1,6 +1,7 @@
 import { AnimatePresence, motion } from "framer-motion";
 import {
   BarChart3,
+  CalendarDays,
   Check,
   Clipboard,
   Link2,
@@ -37,6 +38,8 @@ import {
   now,
   pendingGets,
   readJSON,
+  toDateKey,
+  parseDateKey,
   themes,
   useGame,
   writeRoom,
@@ -45,11 +48,14 @@ import { elapsed, formatTime, statusLabel } from "./game/formatters";
 
 function App() {
   const room = useGame((s) => s.room);
+  const mode = useGame((s) => s.mode);
   const theme = useGame((s) => s.theme);
   const player = useGame((s) => s.player);
   const publish = useGame((s) => s.publish);
   const joinRoom = useGame((s) => s.joinRoom);
   const leaveRoom = useGame((s) => s.leaveRoom);
+  const openDailyBoard = useGame((s) => s.openDailyBoard);
+  const leaveDaily = useGame((s) => s.leaveDaily);
   const setTheme = useGame((s) => s.setTheme);
   const ws = useGame((s) => s.ws);
   const [activeSnack, setActiveSnack] = useState(null);
@@ -156,7 +162,14 @@ function App() {
   }, [addSnack]);
 
   useEffect(() => {
-    const code = new URLSearchParams(location.search).get("room");
+    const params = new URLSearchParams(location.search);
+    const code = params.get("room");
+    const daily = params.get("daily");
+    if (daily && !code) {
+      openDailyBoard(decodeURIComponent(daily));
+      setUrlJoinPending(false);
+      return;
+    }
     if (!code) {
       setUrlJoinPending(false);
       return;
@@ -188,12 +201,19 @@ function App() {
       cancelled = true;
       if (failTimer) clearTimeout(failTimer);
     };
-  }, [joinRoom, room?.code, ws]);
+  }, [joinRoom, room?.code, ws, openDailyBoard]);
 
   useEffect(() => {
     const onPopState = () => {
-      const code = new URLSearchParams(location.search).get("room");
+      const params = new URLSearchParams(location.search);
+      const code = params.get("room");
+      const daily = params.get("daily");
       const currentCode = useGame.getState().room?.code || null;
+      if (daily && !code) {
+        setUrlJoinPending(false);
+        useGame.getState().openDailyBoard(decodeURIComponent(daily));
+        return;
+      }
       if (code) {
         const nextCode = code.toUpperCase();
         if (currentCode !== nextCode) {
@@ -206,6 +226,7 @@ function App() {
       }
       setUrlJoinPending(false);
       if (currentCode) useGame.getState().leaveRoom({ historyMode: "replace" });
+      if (useGame.getState().mode === "daily") useGame.getState().leaveDaily();
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
@@ -286,11 +307,26 @@ function App() {
         tag === "select" ||
         event.target?.isContentEditable;
       if (isTypingTarget) return;
-      if (!useGame.getState().room) return;
+      const state = useGame.getState();
+      const isDaily = state.mode === "daily" && state.dailyBoard;
+      if (!state.room && !isDaily) return;
       if (event.key.startsWith("Arrow")) {
-        const state = useGame.getState();
         const room = state.room;
         const player = state.player;
+        if (isDaily) {
+          event.preventDefault();
+          const selected = state.dailySelected;
+          const base = selected === null ? 0 : selected;
+          const row = Math.floor(base / 9);
+          const col = base % 9;
+          let next = base;
+          if (event.key === "ArrowUp") next = Math.max(0, (row - 1) * 9 + col);
+          if (event.key === "ArrowDown") next = Math.min(80, (row + 1) * 9 + col);
+          if (event.key === "ArrowLeft") next = Math.max(0, row * 9 + (col - 1));
+          if (event.key === "ArrowRight") next = Math.min(80, row * 9 + (col + 1));
+          useGame.getState().setDailySelected(next);
+          return;
+        }
         const viewingId = state.viewingId || player.id;
         const me = room?.players?.[player.id];
         const canNavigate = viewingId === player.id && me && me.status !== "spectating" && me.status !== "lost";
@@ -319,7 +355,12 @@ function App() {
       if (event.key.toLowerCase() === "z" && (event.metaKey || event.ctrlKey)) useGame.getState().undo();
       if (event.code === "Space") {
         event.preventDefault();
-        useGame.setState({ inputMode: useGame.getState().inputMode === "value" ? "note" : "value" });
+        const current = useGame.getState();
+        if (current.mode === "daily") {
+          useGame.setState({ dailyInputMode: current.dailyInputMode === "value" ? "note" : "value" });
+          return;
+        }
+        useGame.setState({ inputMode: current.inputMode === "value" ? "note" : "value" });
       }
     };
     window.addEventListener("keydown", onKey);
@@ -347,11 +388,39 @@ function App() {
     return () => clearInterval(cleanup);
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!window.matchMedia("(max-width: 768px)").matches) return;
+    let targetId = null;
+    if (mode === "daily") targetId = "daily-board-anchor";
+    if (room && room.status !== "lobby") targetId = "room-board-anchor";
+    if (!targetId) return;
+    const timer = setTimeout(() => {
+      const target = document.getElementById(targetId);
+      if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 140);
+    return () => clearTimeout(timer);
+  }, [mode, room?.code, room?.status]);
+
   return (
     <main className={`${themes[theme]} min-h-screen bg-[var(--bg)] text-[var(--text)] transition-colors`}>
       <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col px-4 py-4 sm:px-6 lg:px-8">
-        <Header onHome={leaveRoom} />
-        {room ? <Room /> : urlJoinPending ? <RoomLoading room={{ code: new URLSearchParams(location.search).get("room")?.toUpperCase() || "..." }} /> : <Home />}
+        <Header onHome={() => {
+          if (mode === "daily") {
+            leaveDaily();
+            return;
+          }
+          leaveRoom();
+        }} />
+        {mode === "daily" ? (
+          <DailyPlay />
+        ) : room ? (
+          <Room />
+        ) : urlJoinPending ? (
+          <RoomLoading room={{ code: new URLSearchParams(location.search).get("room")?.toUpperCase() || "..." }} />
+        ) : (
+          <Home />
+        )}
         <SnackbarStack item={activeSnack} onClose={() => setActiveSnack(null)} />
       </div>
     </main>
@@ -407,9 +476,27 @@ function Home() {
   const createSolo = useGame((s) => s.createSolo);
   const joinRoom = useGame((s) => s.joinRoom);
   const stats = useGame((s) => s.stats);
+  const openDailyBoard = useGame((s) => s.openDailyBoard);
+  const dailyProgress = useGame((s) => s.dailyProgress);
+  const getDailyBoard = useGame((s) => s.getDailyBoard);
   const [difficulty, setDifficulty] = useState("Medium");
   const [code, setCode] = useState("");
   const [missing, setMissing] = useState(false);
+  const [selectedDate, setSelectedDate] = useState(() => toDateKey(new Date()));
+  const [monthCursor, setMonthCursor] = useState(() => {
+    const d = new Date();
+    return new Date(d.getFullYear(), d.getMonth(), 1);
+  });
+  const dailyMeta = getDailyBoard(selectedDate);
+  const selectedProgress = dailyProgress[selectedDate];
+  const selectedDateObj = parseDateKey(selectedDate) || new Date();
+  const start = new Date(monthCursor.getFullYear(), monthCursor.getMonth(), 1);
+  const firstWeekday = start.getDay();
+  const daysInMonth = new Date(monthCursor.getFullYear(), monthCursor.getMonth() + 1, 0).getDate();
+  const monthCells = [];
+  for (let i = 0; i < firstWeekday; i += 1) monthCells.push(null);
+  for (let d = 1; d <= daysInMonth; d += 1) monthCells.push(new Date(monthCursor.getFullYear(), monthCursor.getMonth(), d));
+  while (monthCells.length % 7 !== 0) monthCells.push(null);
 
   return (
     <div className="grid flex-1 gap-5 lg:grid-cols-[1.15fr_0.85fr]">
@@ -467,6 +554,71 @@ function Home() {
             {missing && <p className="mt-2 text-sm text-[var(--danger)]">Room code not found on this device.</p>}
           </div>
         </div>
+        <div className="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <CalendarDays size={18} className="text-[var(--accent)]" />
+            <h3 className="font-semibold">Daily Calendar</h3>
+          </div>
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <button
+              className="btn-secondary h-9 px-3"
+              onClick={() => setMonthCursor((m) => new Date(m.getFullYear(), m.getMonth() - 1, 1))}
+            >
+              Prev
+            </button>
+            <p className="text-sm font-semibold">
+              {monthCursor.toLocaleString(undefined, { month: "long", year: "numeric" })}
+            </p>
+            <button
+              className="btn-secondary h-9 px-3"
+              onClick={() => setMonthCursor((m) => new Date(m.getFullYear(), m.getMonth() + 1, 1))}
+            >
+              Next
+            </button>
+          </div>
+          <div className="grid grid-cols-7 gap-1 text-center text-xs text-[var(--muted)]">
+            {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d) => (
+              <div key={d} className="py-1">{d}</div>
+            ))}
+          </div>
+          <div className="mt-1 grid grid-cols-7 gap-1">
+            {monthCells.map((date, idx) => {
+              if (!date) return <div key={`empty-${idx}`} className="h-11 rounded-md bg-transparent" />;
+              const key = toDateKey(date);
+              const status = dailyProgress[key]?.status || "not_started";
+              const selected = key === selectedDate;
+              const statusClass = status === "solved" ? "bg-[var(--good)]" : status === "in_progress" ? "bg-[var(--accent)]" : "bg-[var(--line)]";
+              return (
+                <button
+                  key={key}
+                  className={`relative h-11 rounded-md border text-sm ${selected ? "border-[var(--accent)] bg-[var(--soft)]" : "border-[var(--line)] bg-[var(--panel)]"} ${status === "solved" ? "ring-1 ring-[var(--good)]/50" : ""}`}
+                  onClick={() => setSelectedDate(key)}
+                  title={`${key} - ${status}`}
+                >
+                  <span className={status === "solved" ? "font-semibold text-[var(--good)]" : ""}>{date.getDate()}</span>
+                  {status === "solved" && (
+                    <span className="absolute right-1 top-1 grid size-4 place-items-center rounded-full bg-[var(--good)] text-[var(--accentText)]">
+                      <Check size={10} />
+                    </span>
+                  )}
+                  <span className={`absolute bottom-1 left-1/2 size-1.5 -translate-x-1/2 rounded-full ${statusClass}`} />
+                </button>
+              );
+            })}
+          </div>
+          <div className="mt-3 flex flex-wrap items-end justify-between gap-3">
+            <p>
+              <span className="text-sm text-[var(--muted)]">Selected</span><br />
+              <span className="font-semibold">
+                {String(selectedDateObj.getDate()).padStart(2, "0")}-{String(selectedDateObj.getMonth() + 1).padStart(2, "0")}-{selectedDateObj.getFullYear()}
+              </span>
+              <span className="ml-3 text-sm text-[var(--muted)]">({dailyMeta.difficulty}, {selectedProgress?.status || "not_started"})</span>
+            </p>
+            <button className="btn-primary" onClick={() => openDailyBoard(selectedDate)}>
+              <Play size={18} /> Play Day
+            </button>
+          </div>
+        </div>
       </section>
       <StatsPanel stats={stats} />
     </div>
@@ -476,6 +628,7 @@ function Home() {
 function StatsPanel({ stats }) {
   const history = stats.mistakeHistory || [];
   const recent = history.slice(-12);
+  const [activeBar, setActiveBar] = useState(null);
   const avgMistakes = history.length
     ? (history.reduce((sum, val) => sum + val, 0) / history.length).toFixed(1)
     : "0.0";
@@ -513,12 +666,27 @@ function StatsPanel({ stats }) {
         </div>
         <div className="grid grid-cols-12 items-end gap-1 rounded-md border border-[var(--line)] bg-[var(--soft)] p-2">
           {(recent.length ? recent : [0]).map((mistakes, idx) => (
-            <div
+            <button
               key={`${mistakes}-${idx}`}
+              type="button"
+              className="relative w-full"
               title={`Match ${idx + 1}: ${mistakes} mistakes`}
-              className={mistakes >= 3 ? "w-full rounded-sm bg-[var(--danger)] opacity-90" : "w-full rounded-sm bg-[var(--accent)] opacity-85"}
-              style={{ height: `${Math.max(10, mistakes * 14)}px` }}
-            />
+              onMouseEnter={() => setActiveBar(idx)}
+              onMouseLeave={() => setActiveBar((current) => (current === idx ? null : current))}
+              onFocus={() => setActiveBar(idx)}
+              onBlur={() => setActiveBar((current) => (current === idx ? null : current))}
+              onClick={() => setActiveBar((current) => (current === idx ? null : idx))}
+            >
+              {activeBar === idx && (
+                <span className="absolute -top-7 left-1/2 -translate-x-1/2 rounded-md border border-[var(--line)] bg-[var(--panel)] px-1.5 py-0.5 text-[10px] font-semibold whitespace-nowrap">
+                  {mistakes}
+                </span>
+              )}
+              <span
+                className={mistakes >= 3 ? "block w-full rounded-sm bg-[var(--danger)] opacity-90" : "block w-full rounded-sm bg-[var(--accent)] opacity-85"}
+                style={{ height: `${Math.max(10, mistakes * 14)}px` }}
+              />
+            </button>
           ))}
         </div>
         <p className="mt-2 text-xs text-[var(--muted)]">
@@ -526,6 +694,216 @@ function StatsPanel({ stats }) {
         </p>
       </div>
     </aside>
+  );
+}
+
+function DailyPlay() {
+  const leaveDaily = useGame((s) => s.leaveDaily);
+  const dailyDateKey = useGame((s) => s.dailyDateKey);
+  const dailyBoard = useGame((s) => s.dailyBoard);
+  const dailyProgress = useGame((s) => s.dailyProgress);
+  const dailySelected = useGame((s) => s.dailySelected);
+  const setDailySelected = useGame((s) => s.setDailySelected);
+  const dailyInputMode = useGame((s) => s.dailyInputMode);
+  const setDailyInputMode = useGame((s) => s.setDailyInputMode);
+  const pushMove = useGame((s) => s.pushMove);
+  const erase = useGame((s) => s.erase);
+  const undo = useGame((s) => s.undo);
+  const useHint = useGame((s) => s.useHint);
+  const dailyPaused = useGame((s) => s.dailyPaused);
+  const toggleDailyPause = useGame((s) => s.toggleDailyPause);
+  const dailyRematch = useGame((s) => s.dailyRematch);
+  const [tick, setTick] = useState(0);
+  const dailyStartedAt = useGame((s) => s.dailyStartedAt);
+
+  useEffect(() => {
+    const timer = setInterval(() => setTick((v) => v + 1), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  if (!dailyBoard) return null;
+  const progress = dailyProgress[dailyDateKey] || {};
+  const snapshot = progress.lastBoardSnapshot || { board: [...dailyBoard.puzzle], notes: blankNotes() };
+  const board = snapshot.board;
+  const notes = snapshot.notes;
+  const selectedValue = dailySelected === null ? null : board[dailySelected];
+  const elapsedMs = (progress.elapsedMs || 0) + (progress.status !== "solved" ? Math.max(0, now() - (dailyStartedAt || now())) : 0);
+  const counts = Array.from({ length: 10 }, (_, n) => board.reduce((total, value) => total + (value === n ? 1 : 0), 0));
+  const mistakes = progress.mistakes || 0;
+  const progressPercent = Math.round((board.filter(Boolean).length / 81) * 100);
+  const shareLink = `${window.location.origin}${window.location.pathname}?daily=${encodeURIComponent(dailyDateKey)}`;
+  void tick;
+
+  return (
+    <div className="grid flex-1 gap-4 lg:grid-cols-[minmax(0,1fr)_330px]">
+      <section className="min-w-0 space-y-4">
+        <div className="relative rounded-lg border border-[var(--line)] bg-[var(--panel)] p-3 pr-14 sm:p-4 sm:pr-4">
+          <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto_auto] sm:items-start">
+            <div className="min-w-0">
+              <p className="text-xs uppercase tracking-[0.18em] text-[var(--muted)]">Daily Challenge</p>
+              <p className="text-xl font-semibold sm:text-2xl">{dailyDateKey}</p>
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                <span className="rounded-full border border-[var(--line)] bg-[var(--soft)] px-2 py-1 font-medium">
+                  {dailyBoard.difficulty}
+                </span>
+                <span className="rounded-full border border-[var(--line)] bg-[var(--soft)] px-2 py-1">
+                  {progress.status || "not_started"}
+                </span>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-xs sm:text-sm">
+              <div className="rounded-md border border-[var(--line)] bg-[var(--soft)] px-3 py-2">
+                <p className="text-[var(--muted)]">Progress</p>
+                <p className="font-semibold text-[var(--text)]">{progressPercent}%</p>
+              </div>
+              <div className="rounded-md border border-[var(--line)] bg-[var(--soft)] px-3 py-2">
+                <p className="text-[var(--muted)]">Hints Left</p>
+                <p className="font-semibold text-[var(--text)]">{Math.max(0, 2 - (progress.hintsUsed || 0))}</p>
+              </div>
+            </div>
+            <button className="icon-btn absolute right-3 top-3 sm:static sm:justify-self-end" onClick={leaveDaily} title="Back home">
+              <LogOut size={18} />
+            </button>
+          </div>
+        </div>
+        <div id="daily-board-anchor" className="relative mx-auto w-full max-w-[min(92vw,660px)]">
+          <div className={`sudoku-grid ${dailyPaused ? "blur-md" : ""}`}>
+            {board.map((value, idx) => {
+              const fixed = Boolean(dailyBoard.puzzle[idx]);
+              const row = Math.floor(idx / 9);
+              const col = idx % 9;
+              const sameRow = dailySelected !== null && Math.floor(dailySelected / 9) === row;
+              const sameCol = dailySelected !== null && dailySelected % 9 === col;
+              const sameBox =
+                dailySelected !== null &&
+                Math.floor(Math.floor(dailySelected / 9) / 3) === Math.floor(row / 3) &&
+                Math.floor((dailySelected % 9) / 3) === Math.floor(col / 3);
+              const sameNumber = selectedValue && value === selectedValue;
+              const wrongEntry = !fixed && value && value !== dailyBoard.solution[idx];
+              return (
+                <button
+                  key={idx}
+                  className={["cell", fixed ? "fixed" : "", idx === dailySelected ? "selected" : "", sameRow || sameCol || sameBox ? "peer" : "", sameNumber ? "same" : "", wrongEntry ? "wrong" : ""].join(" ")}
+                  onPointerDown={(event) => event.preventDefault()}
+                  onClick={() => setDailySelected(idx)}
+                  disabled={dailyPaused}
+                >
+                  {value ? (
+                    <span>{value}</span>
+                  ) : (
+                    <div className="notes">
+                      {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => (
+                        <span key={n}>{notes[idx]?.includes(n) ? n : ""}</span>
+                      ))}
+                    </div>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+          {dailyPaused && (
+            <div className="absolute inset-0 grid place-items-center rounded-lg bg-[var(--veil)] text-center backdrop-blur-md">
+              <div>
+                <Pause className="mx-auto mb-3" size={40} />
+                <p className="text-2xl font-semibold">Paused</p>
+                <p className="text-sm text-[var(--muted)]">Daily board is hidden until you resume.</p>
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="mx-auto grid w-full max-w-[min(92vw,660px)] grid-cols-9 gap-1.5 sm:gap-2">
+          {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => (
+            <button
+              key={n}
+              className={counts[n] >= 9 ? "number-btn number-done" : "number-btn"}
+              onPointerDown={(event) => event.preventDefault()}
+              onClick={() => pushMove(n)}
+              disabled={counts[n] >= 9 || dailyPaused}
+            >
+              <span className="text-lg font-semibold leading-none">{n}</span>
+              <span className="text-[10px] font-medium opacity-80">{counts[n]}/9</span>
+            </button>
+          ))}
+        </div>
+        <div className="mb-4 rounded-lg border border-[var(--line)] bg-[var(--panel)] p-3">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div>
+              <p className="text-sm text-[var(--muted)]">Timer</p>
+              <p className="text-2xl font-semibold tabular-nums">{formatTime(elapsedMs)}</p>
+            </div>
+            <div className="text-right">
+              <p className="text-sm text-[var(--muted)]">Mistakes</p>
+              <p className="text-2xl font-semibold text-[var(--danger)]">{Math.min(mistakes, 3)}/3</p>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center">
+            <button className="icon-btn h-10 w-full sm:h-12 sm:w-12 sm:p-0" onClick={undo} title="Undo">
+              <RotateCcw size={18} />
+            </button>
+            <button className="icon-btn h-10 w-full sm:h-12 sm:w-12 sm:p-0" onClick={erase} title="Erase">
+              <Trash2 size={18} />
+            </button>
+            <button className={dailyInputMode === "note" ? "btn-primary h-10 w-full sm:w-auto" : "btn-secondary h-10 w-full sm:w-auto"} onClick={() => setDailyInputMode(dailyInputMode === "value" ? "note" : "value")}>
+              <Pencil size={17} /> {dailyInputMode === "note" ? "Notes" : "Values"}
+            </button>
+            <button
+              className="btn-secondary h-10 w-full cursor-not-allowed opacity-60 pointer-events-none sm:w-auto"
+              onClick={undefined}
+              disabled
+              aria-disabled="true"
+              title="Hint temporarily disabled"
+            >
+              <Lightbulb size={17} /> Hint {Math.max(0, 2 - (progress.hintsUsed || 0))}
+            </button>
+            <button className={dailyPaused ? "btn-primary h-10 w-full sm:w-auto" : "btn-secondary h-10 w-full sm:w-auto"} onClick={toggleDailyPause}>
+              {dailyPaused ? <Play size={17} /> : <Pause size={17} />} {dailyPaused ? "Resume" : "Pause"} 1
+            </button>
+            <button className="btn-secondary h-10 w-full sm:w-auto" onClick={dailyRematch}>
+              <RotateCcw size={17} /> Rematch 1/1
+            </button>
+          </div>
+        </div>
+      </section>
+      <aside className="flex flex-col gap-4">
+        <div className="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <Users size={18} className="text-[var(--accent)]" />
+            <h3 className="font-semibold">Progress</h3>
+          </div>
+          <div className="space-y-3">
+            <div className="w-full rounded-md border border-[var(--line)] p-3">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <span className="flex items-center gap-2 font-medium">
+                  <Eye size={16} className="text-[var(--muted)]" />
+                  You
+                </span>
+                <span className="text-xs text-[var(--muted)]">{progress.status || "not_started"}</span>
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-[var(--soft)]">
+                <div className="h-full rounded-full bg-[var(--accent)]" style={{ width: `${progressPercent}%` }} />
+              </div>
+              <div className="mt-2 flex justify-between text-xs text-[var(--muted)]">
+                <span>{progressPercent}% complete</span>
+                <span>{Math.min(mistakes, 3)}/3 mistakes</span>
+              </div>
+            </div>
+          </div>
+          <button
+            className="btn-secondary mt-4 w-full"
+            onClick={async () => {
+              const ok = await copyText(shareLink);
+              window.dispatchEvent(new CustomEvent("sv-snack", { detail: { message: ok ? "Daily link copied" : "Copy failed" } }));
+            }}
+          >
+            <Link2 size={17} /> Copy Daily Link
+          </button>
+          <div className="mt-4 grid place-items-center rounded-md bg-white p-3">
+            <QRCodeSVG value={shareLink} size={128} />
+          </div>
+        </div>
+      </aside>
+      <DailyCompletionOverlay />
+    </div>
   );
 }
 
@@ -764,37 +1142,45 @@ function GameTopbar() {
   }, []);
 
   return (
-    <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[var(--line)] bg-[var(--panel)] p-3">
-      <div>
-        <p className="text-sm text-[var(--muted)]">Timer</p>
-        <p className="text-2xl font-semibold tabular-nums">{formatTime(elapsed(room))}</p>
+    <div className="mb-4 rounded-lg border border-[var(--line)] bg-[var(--panel)] p-3">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <p className="text-sm text-[var(--muted)]">Timer</p>
+          <p className="text-2xl font-semibold tabular-nums">{formatTime(elapsed(room))}</p>
+        </div>
+        <div className="text-right">
+          <p className="text-sm text-[var(--muted)]">Mistakes</p>
+          <p className="text-2xl font-semibold text-[var(--danger)]">{Math.min(me.mistakes, 3)}/3</p>
+        </div>
       </div>
-      <div className="flex flex-wrap items-center gap-2">
-        <button className="icon-btn" onClick={undo} title="Undo">
+      <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center">
+        <button className="icon-btn h-10 w-full sm:h-12 sm:w-12 sm:p-0" onClick={undo} title="Undo">
           <RotateCcw size={18} />
         </button>
-        <button className="icon-btn" onClick={erase} title="Erase">
+        <button className="icon-btn h-10 w-full sm:h-12 sm:w-12 sm:p-0" onClick={erase} title="Erase">
           <Trash2 size={18} />
         </button>
         <button
-          className={inputMode === "note" ? "btn-primary" : "btn-secondary"}
+          className={inputMode === "note" ? "btn-primary h-10 w-full sm:w-auto" : "btn-secondary h-10 w-full sm:w-auto"}
           onClick={() => setInputMode(inputMode === "value" ? "note" : "value")}
         >
           <Pencil size={17} /> {inputMode === "note" ? "Notes" : "Values"}
         </button>
-        <button className="btn-secondary" onClick={useHint} title="Hint">
+        <button
+          className="btn-secondary h-10 w-full cursor-not-allowed opacity-60 pointer-events-none sm:w-auto"
+          onClick={undefined}
+          title="Hint temporarily disabled"
+          disabled
+          aria-disabled="true"
+        >
           <Lightbulb size={17} /> Hint {Math.max(0, 2 - (me.hintsUsed || 0))}
         </button>
-        <button className={voted ? "btn-primary" : "btn-secondary"} onClick={togglePause}>
+        <button className={voted ? "btn-primary h-10 w-full sm:w-auto" : "btn-secondary h-10 w-full sm:w-auto"} onClick={togglePause}>
           {isPaused ? <Play size={17} /> : <Pause size={17} />} {isPaused ? "Resume" : "Pause"} {voteCount}
         </button>
-        <button className={votedRematch ? "btn-primary" : "btn-secondary"} onClick={toggleRematchVote}>
+        <button className={votedRematch ? "btn-primary h-10 w-full sm:w-auto" : "btn-secondary h-10 w-full sm:w-auto"} onClick={toggleRematchVote}>
           <RotateCcw size={17} /> Rematch {rematchVotes}/{rematchVoterIds.length}
         </button>
-      </div>
-      <div className="text-right">
-        <p className="text-sm text-[var(--muted)]">Mistakes</p>
-        <p className="text-2xl font-semibold text-[var(--danger)]">{Math.min(me.mistakes, 3)}/3</p>
       </div>
     </div>
   );
@@ -813,7 +1199,7 @@ function Board() {
   const canEdit = viewed.id === player.id && me.status !== "spectating" && me.status !== "lost";
 
   return (
-    <div className="relative mx-auto max-w-[min(92vw,660px)]">
+    <div id="room-board-anchor" className="relative mx-auto max-w-[min(92vw,660px)]">
       <div className={`sudoku-grid ${paused ? "blur-md" : ""}`}>
         {viewed.board.map((value, idx) => {
           const fixed = Boolean(room.puzzle[idx]);
@@ -1098,6 +1484,52 @@ function CountdownOverlay() {
         <p className="mt-2 text-5xl font-semibold leading-none">{count}</p>
       </motion.div>
     </div>
+  );
+}
+
+function DailyCompletionOverlay() {
+  const mode = useGame((s) => s.mode);
+  const dailyDateKey = useGame((s) => s.dailyDateKey);
+  const dailyProgress = useGame((s) => s.dailyProgress);
+  const [show, setShow] = useState(false);
+  const shownRef = React.useRef("");
+  const progress = dailyProgress[dailyDateKey] || {};
+  useEffect(() => {
+    if (mode !== "daily" || progress.status !== "solved" || !dailyDateKey) return;
+    if (shownRef.current === dailyDateKey) return;
+    shownRef.current = dailyDateKey;
+    setShow(true);
+    const timer = setTimeout(() => setShow(false), 3600);
+    return () => clearTimeout(timer);
+  }, [mode, progress.status, dailyDateKey]);
+  if (!show) return null;
+  return (
+    <AnimatePresence>
+      <motion.div className="fixed inset-0 z-[90] overflow-hidden" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+        <motion.div className="absolute inset-0 bg-[var(--veil)]" initial={{ opacity: 0 }} animate={{ opacity: 0.9 }} />
+        {Array.from({ length: 28 }).map((_, i) => (
+          <motion.span
+            key={i}
+            className="absolute block h-2 w-2 rounded-full bg-[var(--gold)]"
+            initial={{ x: "50vw", y: "42vh", opacity: 0 }}
+            animate={{
+              x: `calc(50vw + ${Math.cos((i / 28) * Math.PI * 2) * (190 + (i % 5) * 34)}px)`,
+              y: `calc(42vh + ${Math.sin((i / 28) * Math.PI * 2) * (160 + (i % 6) * 28)}px)`,
+              opacity: [0, 1, 0],
+              scale: [0.7, 1.5, 0.8],
+            }}
+            transition={{ duration: 2.1, ease: "easeOut", delay: 0.08 + (i % 6) * 0.03 }}
+          />
+        ))}
+        <div className="absolute inset-0 grid place-items-center px-4">
+          <motion.div className="pointer-events-auto rounded-lg border border-[var(--line)] bg-[var(--panel)] p-6 text-center shadow-2xl" initial={{ scale: 0.6, rotate: -8 }} animate={{ scale: 1.08, rotate: 0 }} transition={{ type: "spring", stiffness: 220, damping: 12 }}>
+            <Crown size={96} className="mx-auto text-[var(--gold)] drop-shadow-[0_0_28px_rgba(202,138,4,0.55)]" />
+            <p className="mt-3 text-3xl font-semibold">Board Completed</p>
+            <p className="mt-1 text-sm text-[var(--muted)]">Daily challenge solved for {dailyDateKey}</p>
+          </motion.div>
+        </div>
+      </motion.div>
+    </AnimatePresence>
   );
 }
 

@@ -1,6 +1,8 @@
 import { create } from "zustand";
 
 export const pendingGets = new Map();
+const DAILY_PROGRESS_KEY = "sv-daily-progress-v1";
+const DAILY_SEED_SALT = 104729;
 
 export const difficulties = {
   Easy: 34,
@@ -20,6 +22,42 @@ export const themes = {
 
 export const blankNotes = () => Array.from({ length: 81 }, () => []);
 export const now = () => Date.now();
+export const toDateKey = (date = new Date()) => {
+  const day = String(date.getDate()).padStart(2, "0");
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const year = date.getFullYear();
+  return `${day}-${month}-${year}`;
+};
+export const parseDateKey = (dateKey) => {
+  const raw = String(dateKey || "");
+  const parts = raw.split("-").map(Number);
+  let day;
+  let month;
+  let year;
+  if (parts.length === 3 && raw.indexOf("-") > -1 && String(parts[0]).length <= 2) {
+    [day, month, year] = parts;
+  } else if (parts.length === 3) {
+    [year, month, day] = parts;
+  }
+  if (!year || !month || !day) return null;
+  const date = new Date(year, month - 1, day);
+  if (Number.isNaN(date.getTime())) return null;
+  return date;
+};
+export const dailyDifficultyForDate = (dateKey) => {
+  const date = parseDateKey(dateKey);
+  if (!date) return "Medium";
+  const rotation = ["Easy", "Medium", "Hard", "Expert", "Master", "Extreme", "Hard"];
+  return rotation[date.getDay()];
+};
+export const seedFromDateKey = (dateKey) => {
+  const normalized = String(dateKey || "");
+  let hash = DAILY_SEED_SALT;
+  for (let i = 0; i < normalized.length; i += 1) {
+    hash = (hash * 31 + normalized.charCodeAt(i)) % 2147483647;
+  }
+  return hash;
+};
 const ONLINE_GRACE_MS = 15000;
 export const EMPTY_ROOM_TTL_MS = 180000;
 export const DARK_THEME = "Cyberpunk";
@@ -187,6 +225,17 @@ export const readJSON = (key, fallback) => {
     return fallback;
   }
 };
+const syncDailyUrl = (dateKey, mode = "replace") => {
+  if (typeof window === "undefined") return;
+  const base = `${window.location.origin}${window.location.pathname}`;
+  const next = dateKey ? `${base}?daily=${encodeURIComponent(dateKey)}` : base;
+  const current = `${window.location.origin}${window.location.pathname}${window.location.search}`;
+  if (current === next) return;
+  const method = mode === "push" ? "pushState" : "replaceState";
+  window.history[method]({}, "", next);
+};
+const readDailyProgress = () => readJSON(DAILY_PROGRESS_KEY, {});
+const writeDailyProgress = (progress) => localStorage.setItem(DAILY_PROGRESS_KEY, JSON.stringify(progress));
 
 export const writeRoom = (room) => {
   localStorage.setItem(`sv-room-${room.code}`, JSON.stringify(room));
@@ -230,6 +279,16 @@ export const useGame = create((set, get) => ({
   theme: localStorage.getItem("sv-theme") || "Nordic",
   ws: null,
   viewingId: null,
+  mode: "home",
+  dailyDateKey: toDateKey(),
+  dailyBoard: null,
+  dailySelected: null,
+  dailyInputMode: "value",
+  dailyHistory: [],
+  dailyStartedAt: null,
+  dailyElapsedMs: 0,
+  dailyPaused: false,
+  dailyProgress: readDailyProgress(),
   history: [],
   stats: readJSON("sv-stats", defaultStats),
   setTheme: (theme) => {
@@ -316,7 +375,7 @@ export const useGame = create((set, get) => ({
       rematchRequests: {},
     };
     get().publish(room);
-    set({ viewingId: player.id, selected: null, history: [] });
+    set({ mode: "room", viewingId: player.id, selected: null, history: [] });
     syncRoomUrl(code, "push");
   },
   createSolo: (difficulty) => {
@@ -330,7 +389,7 @@ export const useGame = create((set, get) => ({
     };
     const started = { ...room, players, status: "playing", startedAt: now() };
     get().publish(started);
-    set({ viewingId: player.id, selected: null, history: [] });
+    set({ mode: "room", viewingId: player.id, selected: null, history: [] });
     syncRoomUrl(room.code, "push");
   },
   joinRoom: async (code, options = {}) => {
@@ -361,7 +420,7 @@ export const useGame = create((set, get) => ({
         },
       };
       get().publish(room);
-      set({ viewingId: player.id, selected: null, history: [] });
+      set({ mode: "room", viewingId: player.id, selected: null, history: [] });
       syncRoomUrl(key, historyMode);
       return true;
     }
@@ -410,7 +469,7 @@ export const useGame = create((set, get) => ({
         },
       };
       get().publish(room);
-      set({ viewingId: player.id, selected: null, history: [] });
+      set({ mode: "room", viewingId: player.id, selected: null, history: [] });
       syncRoomUrl(key, historyMode);
       return true;
     });
@@ -428,7 +487,7 @@ export const useGame = create((set, get) => ({
       });
     }
     syncRoomUrl(null, historyMode);
-    set({ room: null, selected: null, viewingId: null, history: [] });
+    set({ mode: "home", room: null, selected: null, viewingId: null, history: [] });
   },
   toggleReady: () => {
     const { room, player, publish } = get();
@@ -450,6 +509,93 @@ export const useGame = create((set, get) => ({
       countdownEndsAt: canStart ? now() + 3000 : null,
       startedAt: canStart ? null : room.startedAt,
       rematchRequests: {},
+    });
+  },
+  getDailyBoard: (dateKey) => {
+    const key = parseDateKey(dateKey) ? dateKey : toDateKey();
+    const difficulty = dailyDifficultyForDate(key);
+    const seed = seedFromDateKey(key);
+    const generated = generateSudoku(difficulty, seed);
+    return { dateKey: key, difficulty, ...generated };
+  },
+  updateDailyProgress: (dateKey, patch) =>
+    set((state) => {
+      const key = parseDateKey(dateKey) ? dateKey : toDateKey();
+      const current = state.dailyProgress[key] || {
+        status: "not_started",
+        difficulty: dailyDifficultyForDate(key),
+      };
+      const next = { ...current, ...patch };
+      const dailyProgress = { ...state.dailyProgress, [key]: next };
+      writeDailyProgress(dailyProgress);
+      return { dailyProgress };
+    }),
+  markDailySolved: (dateKey, summary) => {
+    const key = parseDateKey(dateKey) ? dateKey : toDateKey();
+    get().updateDailyProgress(key, {
+      status: "solved",
+      solvedAt: now(),
+      ...summary,
+    });
+  },
+  openDailyBoard: (dateKey) => {
+    const board = get().getDailyBoard(dateKey);
+    const progress = get().dailyProgress[board.dateKey];
+    const snapshot = progress?.lastBoardSnapshot;
+    const notes = snapshot?.notes?.length === 81 ? snapshot.notes.map((n) => [...n]) : blankNotes();
+    const boardValues = snapshot?.board?.length === 81 ? [...snapshot.board] : [...board.puzzle];
+    set({
+      mode: "daily",
+      room: null,
+      selected: null,
+      history: [],
+      dailyDateKey: board.dateKey,
+      dailyBoard: board,
+      dailySelected: null,
+      dailyInputMode: "value",
+      dailyHistory: [],
+      dailyStartedAt: now(),
+      dailyElapsedMs: progress?.elapsedMs || 0,
+      dailyPaused: false,
+    });
+    get().updateDailyProgress(board.dateKey, {
+      status: progress?.status === "solved" ? "solved" : snapshot ? "in_progress" : "not_started",
+      difficulty: board.difficulty,
+      startedAt: progress?.startedAt || now(),
+      lastBoardSnapshot: { board: boardValues, notes },
+      elapsedMs: progress?.elapsedMs || 0,
+      mistakes: progress?.mistakes || 0,
+    });
+    syncDailyUrl(board.dateKey, "push");
+  },
+  setDailySelected: (dailySelected) => set({ dailySelected }),
+  setDailyInputMode: (dailyInputMode) => set({ dailyInputMode }),
+  toggleDailyPause: () => set((state) => ({ dailyPaused: !state.dailyPaused })),
+  dailyRematch: () => {
+    const { dailyBoard, dailyDateKey } = get();
+    if (!dailyBoard) return;
+    set({ dailySelected: null, dailyHistory: [], dailyStartedAt: now(), dailyElapsedMs: 0, dailyPaused: false });
+    get().updateDailyProgress(dailyDateKey, {
+      status: "not_started",
+      startedAt: now(),
+      solvedAt: null,
+      elapsedMs: 0,
+      mistakes: 0,
+      hintsUsed: 0,
+      lastBoardSnapshot: { board: [...dailyBoard.puzzle], notes: blankNotes() },
+    });
+  },
+  leaveDaily: () => {
+    syncDailyUrl(null, "push");
+    set({
+      mode: "home",
+      dailyBoard: null,
+      dailySelected: null,
+      dailyInputMode: "value",
+      dailyHistory: [],
+      dailyStartedAt: null,
+      dailyElapsedMs: 0,
+      dailyPaused: false,
     });
   },
   setSelected: (selected) => set({ selected }),
@@ -533,6 +679,36 @@ export const useGame = create((set, get) => ({
     set({ viewingId: targetId });
   },
   useHint: () => {
+    if (get().mode === "daily" && get().dailyBoard) {
+      const { dailyBoard, dailySelected, dailyDateKey, dailyProgress, dailyStartedAt, dailyElapsedMs, dailyPaused } = get();
+      if (dailySelected === null || dailyBoard.puzzle[dailySelected] || dailyPaused) return;
+      const progress = dailyProgress[dailyDateKey] || {};
+      if ((progress.hintsUsed || 0) >= 2) {
+        window.dispatchEvent(new CustomEvent("sv-snack", { detail: { message: "You already used 2 hints on this board." } }));
+        return;
+      }
+      const snapshot = progress.lastBoardSnapshot || { board: [...dailyBoard.puzzle], notes: blankNotes() };
+      const board = [...snapshot.board];
+      const notes = snapshot.notes.map((n) => [...n]);
+      const digit = dailyBoard.solution[dailySelected];
+      if (board[dailySelected] === digit) return;
+      board[dailySelected] = digit;
+      notes[dailySelected] = [];
+      cellPeers(dailySelected).forEach((idx) => {
+        notes[idx] = notes[idx].filter((n) => n !== digit);
+      });
+      const elapsedMs = (progress.elapsedMs || dailyElapsedMs || 0) + Math.max(0, now() - (dailyStartedAt || now()));
+      const solved = board.every((value, idx) => value === dailyBoard.solution[idx]);
+      get().updateDailyProgress(dailyDateKey, {
+        status: solved ? "solved" : "in_progress",
+        solvedAt: solved ? now() : progress.solvedAt || null,
+        elapsedMs,
+        hintsUsed: (progress.hintsUsed || 0) + 1,
+        lastBoardSnapshot: { board, notes },
+      });
+      set({ dailyStartedAt: now(), dailyElapsedMs: elapsedMs });
+      return;
+    }
     const { room, player, selected, publish, history } = get();
     const me = room?.players?.[player.id];
     if (!room || !me) return;
@@ -660,12 +836,66 @@ export const useGame = create((set, get) => ({
     });
   },
   pushMove: (digit) => {
+    if (get().mode === "daily" && get().dailyBoard) {
+      const {
+        dailyBoard,
+        dailySelected,
+        dailyInputMode,
+        dailyHistory,
+        dailyProgress,
+        dailyDateKey,
+        dailyStartedAt,
+        dailyElapsedMs,
+        dailyPaused,
+      } = get();
+      if (dailySelected === null || dailyBoard.puzzle[dailySelected] || dailyPaused) return;
+      const progress = dailyProgress[dailyDateKey] || {};
+      const snapshot = progress.lastBoardSnapshot || { board: [...dailyBoard.puzzle], notes: blankNotes() };
+      const board = [...snapshot.board];
+      const notes = snapshot.notes.map((n) => [...n]);
+      if (board.filter((value) => value === digit).length >= 9) return;
+      if (dailyInputMode === "value" && board[dailySelected] === digit) return;
+      const historyItem = { board: [...board], notes: notes.map((n) => [...n]) };
+      let mistakes = progress.mistakes || 0;
+      if (dailyInputMode === "note") {
+        if (board[dailySelected]) return;
+        notes[dailySelected] = notes[dailySelected].includes(digit)
+          ? notes[dailySelected].filter((n) => n !== digit)
+          : [...notes[dailySelected], digit].sort();
+      } else if (dailyBoard.solution[dailySelected] === digit) {
+        board[dailySelected] = digit;
+        notes[dailySelected] = [];
+        cellPeers(dailySelected).forEach((idx) => {
+          notes[idx] = notes[idx].filter((n) => n !== digit);
+        });
+      } else {
+        board[dailySelected] = digit;
+        notes[dailySelected] = [];
+        mistakes += 1;
+      }
+      const solved = board.every((value, idx) => value === dailyBoard.solution[idx]);
+      const elapsedMs = (progress.elapsedMs || dailyElapsedMs || 0) + Math.max(0, now() - (dailyStartedAt || now()));
+      const patch = {
+        status: solved ? "solved" : "in_progress",
+        mistakes,
+        elapsedMs,
+        lastBoardSnapshot: { board, notes },
+      };
+      if (solved) patch.solvedAt = now();
+      get().updateDailyProgress(dailyDateKey, patch);
+      set({
+        dailyHistory: [...dailyHistory, historyItem].slice(-120),
+        dailyStartedAt: now(),
+        dailyElapsedMs: elapsedMs,
+      });
+      return;
+    }
     const { room, player, selected, inputMode, publish, history, saveStats, countPlaced } = get();
     const me = room?.players?.[player.id];
     if (!room || !me || selected === null || room.puzzle[selected] || room.pausedAt || me.status === "spectating" || me.status === "lost") return;
     if (room.status === "countdown") return;
     if (get().viewingId && get().viewingId !== player.id) return;
-    if (inputMode === "value" && countPlaced(me.board, digit) >= 9) return;
+    if (countPlaced(me.board, digit) >= 9) return;
     if (room.status === "ended" && me.status !== "continue") return;
     if (inputMode === "value" && me.board[selected] === digit) return;
 
@@ -759,6 +989,27 @@ export const useGame = create((set, get) => ({
     set({ history: [...history, snapshot].slice(-120) });
   },
   erase: () => {
+    if (get().mode === "daily" && get().dailyBoard) {
+      const { dailyProgress, dailyDateKey, dailySelected, dailyHistory, dailyStartedAt, dailyElapsedMs, dailyPaused } = get();
+      if (dailyPaused) return;
+      const progress = dailyProgress[dailyDateKey];
+      if (!progress || dailySelected === null) return;
+      const snapshot = progress.lastBoardSnapshot;
+      if (!snapshot || get().dailyBoard.puzzle[dailySelected]) return;
+      const board = [...snapshot.board];
+      const notes = snapshot.notes.map((n) => [...n]);
+      const historyItem = { board: [...board], notes: notes.map((n) => [...n]) };
+      board[dailySelected] = 0;
+      notes[dailySelected] = [];
+      const elapsedMs = (progress.elapsedMs || dailyElapsedMs || 0) + Math.max(0, now() - (dailyStartedAt || now()));
+      get().updateDailyProgress(dailyDateKey, {
+        status: "in_progress",
+        elapsedMs,
+        lastBoardSnapshot: { board, notes },
+      });
+      set({ dailyHistory: [...dailyHistory, historyItem].slice(-120), dailyStartedAt: now(), dailyElapsedMs: elapsedMs });
+      return;
+    }
     const { room, player, selected, publish, history } = get();
     const me = room?.players?.[player.id];
     if (!room || !me || selected === null || room.puzzle[selected] || room.pausedAt || me.status === "spectating" || me.status === "lost") return;
@@ -778,6 +1029,17 @@ export const useGame = create((set, get) => ({
     set({ history: [...history, snapshot].slice(-120) });
   },
   undo: () => {
+    if (get().mode === "daily" && get().dailyBoard) {
+      const { dailyHistory, dailyDateKey } = get();
+      const last = dailyHistory.at(-1);
+      if (!last) return;
+      get().updateDailyProgress(dailyDateKey, {
+        status: "in_progress",
+        lastBoardSnapshot: { board: last.board, notes: last.notes },
+      });
+      set({ dailyHistory: dailyHistory.slice(0, -1) });
+      return;
+    }
     const { room, player, publish, history } = get();
     const me = room?.players?.[player.id];
     if (!room || !me) return;
