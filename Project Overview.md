@@ -2,18 +2,22 @@
 
 ## What This App Is
 
-Sudoku Versus is a real-time Sudoku game built with React, Vite, Zustand, Tailwind CSS, Framer Motion, and a lightweight WebSocket room relay. It supports competitive multiplayer room play, solo play, and a date-based daily challenge mode.
+Sudostrike is a real-time Sudoku game built with React 19, Vite, Zustand, Tailwind CSS, Framer Motion, and a lightweight WebSocket room relay. It supports competitive multiplayer room play, solo play, and a date-based daily challenge mode.
 
 The app is designed around fast puzzle play, shared room state, local persistence, and a responsive interface that works on desktop and mobile.
 
 ## Core Architecture
 
-- Frontend UI is rendered from React in src/App.jsx and bootstrapped in src/main.jsx.
-- Application state is managed with Zustand in src/game/store.js.
-- Styling uses Tailwind utility classes plus custom CSS variables and component rules in src/styles.css.
-- Multiplayer rooms are synchronized locally through localStorage, across tabs through BroadcastChannel, and across devices through WebSocket.
-- The production server in server.js serves the built app and exposes a room relay WebSocket endpoint.
-- The Vite dev server also attaches the same relay during development through vite.config.js.
+- Frontend UI is rendered from React in `src/App.jsx` and bootstrapped in `src/main.jsx`.
+- Application state is managed with Zustand in `src/game/store.js`.
+- Pure game move logic is isolated in `src/game/engine.js`.
+- Puzzle generation and unique-solution bitmask solving live in `src/game/sudoku.js`.
+- Persistent storage guards and schema normalizations live in `src/persist/storage.js`.
+- Web Audio sound effects are encapsulated in `src/audio/sound.js`.
+- Styling uses Tailwind utility classes plus custom CSS variables and component rules in `src/styles.css`.
+- Multiplayer rooms are synchronized locally through `localStorage`, across tabs through `BroadcastChannel`, and across devices through WebSocket.
+- The production server in `server.js` serves the built app and exposes a room relay WebSocket endpoint.
+- The Vite dev server also attaches the same relay during development through `vite.config.js`.
 
 ## Main Functionalities
 
@@ -42,11 +46,11 @@ The app is designed around fast puzzle play, shared room state, local persistenc
 
 ### Lobby Flow
 
-- Starts room play in a lobby state before the game begins.
-- Requires players to ready up before the puzzle starts.
+- Starts multiplayer room play in a lobby state before the game begins (solo mode bypasses the lobby and starts playing immediately).
+- Requires players in multiplayer rooms to ready up before the puzzle starts.
 - Shows the readiness state for all players in the room.
-- Only starts the countdown when every online player is ready and there are at least two players.
-- Shows a message when the room cannot start because there are not enough players.
+- Starts the countdown when every online player is ready and there are at least two players.
+- Shows an informative message when the room cannot start because more players are needed.
 
 ### Competitive Room Gameplay
 
@@ -116,11 +120,11 @@ The app is designed around fast puzzle play, shared room state, local persistenc
 
 ### Hints
 
-- Hint logic exists in the shared game store for both room and daily modes.
+- Hint logic exists in the shared move engine for both room and daily modes.
 - Hints fill the selected cell with the correct number.
 - Hints clear conflicting peer notes.
 - Hints are limited to two uses per board.
-- The current visible hint buttons in the UI are disabled, so the hint action is implemented but not exposed as an active control in the present interface.
+- Hint buttons are actively exposed and show the remaining hint badge count.
 
 ### Daily Challenge Mode
 
@@ -171,7 +175,7 @@ The app is designed around fast puzzle play, shared room state, local persistenc
 - Supports keyboard-only play.
 - Prevents keyboard shortcuts from firing inside text inputs and editable controls.
 - Navigates the selected cell with arrow keys in both room and daily modes.
-- Switches input mode with Space.
+- Switches input mode with Space (guarded so focused buttons can be activated).
 - Scrolls the active board into view on small screens.
 - Keeps the interface usable on mobile with responsive grids and button layouts.
 
@@ -212,14 +216,22 @@ The app is designed around fast puzzle play, shared room state, local persistenc
 
 ## File Map
 
-- index.html: HTML shell that mounts the React app.
-- src/main.jsx: React root bootstrap and global stylesheet import.
-- src/App.jsx: Application shell, screens, room UI, daily UI, overlays, and interaction handling.
-- src/game/store.js: State store, Sudoku generation, persistence, room actions, daily actions, and sync helpers.
-- src/game/formatters.js: Time and player status formatting helpers.
-- src/styles.css: Theme tokens, component styles, board styles, and animations.
-- server.js: Production static server and WebSocket room relay host.
-- roomRelay.js: In-memory WebSocket room relay and cleanup logic.
-- vite.config.js: Vite build and dev configuration.
-- tailwind.config.js: Tailwind configuration and theme extensions.
-- postcss.config.js: PostCSS setup.
+- `index.html`: HTML shell that mounts the React app.
+- `src/main.jsx`: React root bootstrap with top-level Error Boundary and global stylesheet import.
+- `src/App.jsx`: Application shell, screens, room UI, daily UI, overlays, and interaction handling.
+- `src/audio/sound.js`: Web Audio API sound generator with mute toggle and gesture unlocking.
+- `src/persist/storage.js`: Safe `localStorage` wrappers with error handling and quota alerts.
+- `src/game/engine.js`: Pure move engine (`applyMove`) handling digit placement, notes, erase, and hints.
+- `src/game/engine.test.js`: Unit tests for the pure move engine.
+- `src/game/store.js`: State store, presence management, daily caching, room actions, and sync helpers.
+- `src/game/store.test.js`: Unit tests for store normalization, presence merges, and timers.
+- `src/game/sudoku.js`: Sudoku puzzle generator and bitmask backtracking solver.
+- `src/game/sudoku.test.js`: Unit tests for solver uniqueness, determinism, and blanks.
+- `src/game/formatters.js`: Time and player status formatting helpers.
+- `src/game/relay.test.js`: Unit tests for monotonic relay revision handling.
+- `src/styles.css`: Theme tokens, component styles, board styles, and animations.
+- `server.js`: Production static server and WebSocket room relay host.
+- `roomRelay.js`: In-memory WebSocket room relay and cleanup logic.
+- `vite.config.js`: Vite build and dev configuration with integrated WebSocket relay.
+- `tailwind.config.js`: Tailwind configuration and theme extensions.
+- `postcss.config.js`: PostCSS setup.

@@ -17,6 +17,7 @@ import {
   ScanLine,
   Sparkles,
   Sun,
+  Timer,
   Trash2,
   Users,
   Wifi,
@@ -32,20 +33,26 @@ import {
   copyText,
   difficulties,
   blankNotes,
+  digitIsComplete,
   getPauseVoterIds,
   isPlayerOnline,
   mergeRoomPresence,
+  normalizeRoom,
+  createPlayer,
   now,
   pendingGets,
+  resolvePendingGet,
   readJSON,
+  storage,
   toDateKey,
   parseDateKey,
+  canonicalDateKey,
   isFutureDateKey,
   themes,
   useGame,
   writeRoom,
 } from "./game/store";
-import { elapsed, formatTime, statusLabel } from "./game/formatters";
+import { boardProgress, elapsed, formatTime, matchStanding, statusLabel } from "./game/formatters";
 
 function App() {
   const room = useGame((s) => s.room);
@@ -59,34 +66,48 @@ function App() {
   const leaveDaily = useGame((s) => s.leaveDaily);
   const setTheme = useGame((s) => s.setTheme);
   const ws = useGame((s) => s.ws);
-  const [activeSnack, setActiveSnack] = useState(null);
+  const addSnack = useGame((s) => s.addSnack);
   const prevRoomRef = React.useRef(null);
   const [urlJoinPending, setUrlJoinPending] = useState(() => Boolean(new URLSearchParams(location.search).get("room")));
-  const addSnack = useCallback((text) => {
-    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    setActiveSnack({ id, text });
-  }, []);
 
   useEffect(() => {
-    if (!activeSnack) return undefined;
-    const timer = setTimeout(() => setActiveSnack(null), 2600);
-    return () => clearTimeout(timer);
-  }, [activeSnack?.id]);
-
-  useEffect(() => {
-    const channel = new BroadcastChannel("sudoku-versus");
+    const channel = new BroadcastChannel("sudostrike");
     useGame.setState({ channel });
     channel.onmessage = (event) => {
+      const data = event.data;
+      if (data?.type === "presence") {
+        const current = useGame.getState().room;
+        if (current && current.code === data.code && current.players?.[data.playerId]) {
+          const target = current.players[data.playerId];
+          useGame.setState({
+            room: {
+              ...current,
+              players: {
+                ...current.players,
+                [data.playerId]: {
+                  ...target,
+                  connected: true,
+                  lastSeen: Math.max(target.lastSeen || 0, data.lastSeen || now()),
+                },
+              },
+            },
+          });
+        }
+        return;
+      }
       const current = useGame.getState().room;
-      if (!current || event.data.code !== current.code) return;
-      if ((event.data.updatedAt || 0) >= (current.updatedAt || 0)) {
-        useGame.setState({ room: mergeRoomPresence(current, event.data) });
+      const next = normalizeRoom(data);
+      if (!current || !next || next.code !== current.code) return;
+      if ((next.updatedAt || 0) >= (current.updatedAt || 0)) {
+        useGame.setState({ room: mergeRoomPresence(current, next) });
       }
     };
     const onLocal = (event) => {
       const current = useGame.getState().room;
-      if (current?.code === event.detail.code && event.detail.updatedAt >= (current.updatedAt || 0)) {
-        useGame.setState({ room: mergeRoomPresence(current, event.detail) });
+      const next = normalizeRoom(event.detail);
+      if (!current || !next || current.code !== next.code) return;
+      if ((next.updatedAt || 0) >= (current.updatedAt || 0)) {
+        useGame.setState({ room: mergeRoomPresence(current, next) });
       }
     };
     const onSnack = (event) => {
@@ -121,17 +142,47 @@ function App() {
           } catch (e) {
             return;
           }
+          if (msg?.type === "presence") {
+            const current = useGame.getState().room;
+            if (current && current.code === msg.code && current.players?.[msg.playerId]) {
+              const target = current.players[msg.playerId];
+              useGame.setState({
+                room: {
+                  ...current,
+                  players: {
+                    ...current.players,
+                    [msg.playerId]: {
+                      ...target,
+                      connected: true,
+                      lastSeen: Math.max(target.lastSeen || 0, msg.lastSeen || now()),
+                    },
+                  },
+                },
+              });
+            }
+            return;
+          }
           if (msg?.type === "room") {
-            if (msg.code) {
-              const pending = pendingGets.get(msg.code.toUpperCase());
-              if (pending) {
-                pending.resolve(msg.room || null);
-                pendingGets.delete(msg.code.toUpperCase());
-              }
+            if (msg.reqId || msg.code) {
+              resolvePendingGet(msg.reqId, msg.code, msg.room || null);
             }
             if (msg.room) {
-              writeRoom(msg.room);
-              window.dispatchEvent(new CustomEvent("sv-room-local", { detail: msg.room }));
+              const next = normalizeRoom(msg.room);
+              const currentRoom = useGame.getState().room;
+              // Stop persisting other people's rooms (#17)
+              const isCurrentRoom = currentRoom && currentRoom.code === next?.code;
+              const isJoiningRoom = [...pendingGets.values()].some((entry) => entry.code === next?.code);
+              if (next && (isCurrentRoom || isJoiningRoom)) {
+                writeRoom(next);
+                window.dispatchEvent(new CustomEvent("sv-room-local", { detail: next }));
+              }
+            }
+          }
+          if (msg?.type === "room:closed") {
+            const currentRoom = useGame.getState().room;
+            if (currentRoom && currentRoom.code === String(msg.code || "").toUpperCase()) {
+              addSnack("Room closed due to inactivity.");
+              useGame.getState().leaveRoom({ historyMode: "replace" });
             }
           }
         });
@@ -142,7 +193,7 @@ function App() {
         ws.addEventListener("error", () => {
           try {
             ws.close();
-          } catch (e) {}
+          } catch (e) { }
         });
       } catch (e) {
         if (!disposed) reconnectTimer = setTimeout(() => connectWs(attempt + 1), 350);
@@ -155,7 +206,7 @@ function App() {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       try {
         useGame.getState().ws?.close();
-      } catch (e) {}
+      } catch (e) { }
       channel.close();
       window.removeEventListener("sv-room-local", onLocal);
       window.removeEventListener("sv-snack", onSnack);
@@ -167,7 +218,7 @@ function App() {
     const code = params.get("room");
     const daily = params.get("daily");
     if (daily && !code) {
-      openDailyBoard(decodeURIComponent(daily));
+      openDailyBoard(decodeURIComponent(daily), { historyMode: "replace" });
       setUrlJoinPending(false);
       return;
     }
@@ -183,51 +234,63 @@ function App() {
     let cancelled = false;
     let failTimer = null;
     setUrlJoinPending(true);
-    joinRoom(targetCode, { historyMode: "replace" }).then((ok) => {
+    joinRoom(targetCode, { historyMode: "replace" }).then((res) => {
       if (cancelled) return;
       const currentCode = new URLSearchParams(location.search).get("room");
       if (!currentCode || currentCode.toUpperCase() !== targetCode) {
         setUrlJoinPending(false);
         return;
       }
-      if (ok || ws?.readyState === WebSocket.OPEN) {
-        setUrlJoinPending(false);
-        return;
+      setUrlJoinPending(false);
+      if (!res?.ok) {
+        const reason = res?.reason;
+        if (reason === "not_found") {
+          addSnack(`Room ${targetCode} not found.`);
+        } else if (reason === "full") {
+          addSnack(`Room ${targetCode} is full (maximum 8 players).`);
+        } else if (reason === "kicked") {
+          addSnack(`You were kicked from room ${targetCode}.`);
+        } else {
+          addSnack(`Could not connect to room ${targetCode}.`);
+        }
       }
-      failTimer = setTimeout(() => {
-        if (!cancelled) setUrlJoinPending(false);
-      }, 2200);
     });
     return () => {
       cancelled = true;
-      if (failTimer) clearTimeout(failTimer);
     };
-  }, [joinRoom, room?.code, ws, openDailyBoard]);
+  }, [joinRoom, room?.code, addSnack, openDailyBoard]);
 
   useEffect(() => {
     const onPopState = () => {
       const params = new URLSearchParams(location.search);
       const code = params.get("room");
       const daily = params.get("daily");
-      const currentCode = useGame.getState().room?.code || null;
+      const state = useGame.getState();
+      const currentCode = state.room?.code || null;
+      const currentDaily = state.dailyDateKey || null;
+      const currentMode = state.mode;
+
       if (daily && !code) {
         setUrlJoinPending(false);
-        useGame.getState().openDailyBoard(decodeURIComponent(daily));
+        const canonical = canonicalDateKey(decodeURIComponent(daily));
+        if (currentMode !== "daily" || currentDaily !== canonical) {
+          state.openDailyBoard(canonical, { historyMode: "replace" });
+        }
         return;
       }
       if (code) {
         const nextCode = code.toUpperCase();
         if (currentCode !== nextCode) {
           setUrlJoinPending(true);
-          useGame.getState().joinRoom(nextCode, { historyMode: "replace" }).finally(() => {
+          state.joinRoom(nextCode, { historyMode: "replace" }).finally(() => {
             setUrlJoinPending(false);
           });
         }
         return;
       }
       setUrlJoinPending(false);
-      if (currentCode) useGame.getState().leaveRoom({ historyMode: "replace" });
-      if (useGame.getState().mode === "daily") useGame.getState().leaveDaily();
+      if (currentCode) state.leaveRoom({ historyMode: "replace" });
+      if (currentMode === "daily") state.leaveDaily({ historyMode: "replace" });
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
@@ -256,13 +319,7 @@ function App() {
         });
         return;
       }
-      publish({
-        ...current,
-        players: {
-          ...current.players,
-          [player.id]: { ...current.players[player.id], connected: true, lastSeen: now() },
-        },
-      });
+      state.sendHeartbeat();
     }, 2500);
     return () => clearInterval(interval);
   }, [room?.code, player.id, publish]);
@@ -321,10 +378,10 @@ function App() {
           const row = Math.floor(base / 9);
           const col = base % 9;
           let next = base;
-          if (event.key === "ArrowUp") next = Math.max(0, (row - 1) * 9 + col);
-          if (event.key === "ArrowDown") next = Math.min(80, (row + 1) * 9 + col);
-          if (event.key === "ArrowLeft") next = Math.max(0, row * 9 + (col - 1));
-          if (event.key === "ArrowRight") next = Math.min(80, row * 9 + (col + 1));
+          if (event.key === "ArrowUp") next = row > 0 ? (row - 1) * 9 + col : base;
+          if (event.key === "ArrowDown") next = row < 8 ? (row + 1) * 9 + col : base;
+          if (event.key === "ArrowLeft") next = col > 0 ? row * 9 + (col - 1) : base;
+          if (event.key === "ArrowRight") next = col < 8 ? row * 9 + (col + 1) : base;
           useGame.getState().setDailySelected(next);
           return;
         }
@@ -338,10 +395,10 @@ function App() {
         const row = Math.floor(base / 9);
         const col = base % 9;
         let next = base;
-        if (event.key === "ArrowUp") next = Math.max(0, (row - 1) * 9 + col);
-        if (event.key === "ArrowDown") next = Math.min(80, (row + 1) * 9 + col);
-        if (event.key === "ArrowLeft") next = Math.max(0, row * 9 + (col - 1));
-        if (event.key === "ArrowRight") next = Math.min(80, row * 9 + (col + 1));
+        if (event.key === "ArrowUp") next = row > 0 ? (row - 1) * 9 + col : base;
+        if (event.key === "ArrowDown") next = row < 8 ? (row + 1) * 9 + col : base;
+        if (event.key === "ArrowLeft") next = col > 0 ? row * 9 + (col - 1) : base;
+        if (event.key === "ArrowRight") next = col < 8 ? row * 9 + (col + 1) : base;
         useGame.getState().setSelected(next);
         return;
       }
@@ -355,6 +412,7 @@ function App() {
       if (event.key === "Backspace" || event.key === "Delete") useGame.getState().erase();
       if (event.key.toLowerCase() === "z" && (event.metaKey || event.ctrlKey)) useGame.getState().undo();
       if (event.code === "Space") {
+        if (tag === "button") return;
         event.preventDefault();
         const current = useGame.getState();
         if (current.mode === "daily") {
@@ -371,19 +429,19 @@ function App() {
   useEffect(() => {
     const cleanup = setInterval(() => {
       const ts = now();
-      const keys = Object.keys(localStorage).filter((k) => k.startsWith("sv-room-"));
+      const keys = storage.keys().filter((k) => k.startsWith("sv-room-"));
       keys.forEach((key) => {
-        const room = readJSON(key, null);
+        const room = normalizeRoom(readJSON(key, null));
         if (!room?.players) return;
         const players = Object.values(room.players);
         if (players.length === 0) {
-          localStorage.removeItem(key);
+          storage.remove(key);
           return;
         }
         const everyoneOffline = players.every((p) => !isPlayerOnline(p, ts));
         if (!everyoneOffline) return;
         const latestSeen = Math.max(...players.map((p) => p?.lastSeen || 0));
-        if (ts - latestSeen >= EMPTY_ROOM_TTL_MS) localStorage.removeItem(key);
+        if (ts - latestSeen >= EMPTY_ROOM_TTL_MS) storage.remove(key);
       });
     }, 15000);
     return () => clearInterval(cleanup);
@@ -422,7 +480,7 @@ function App() {
         ) : (
           <Home />
         )}
-        <SnackbarStack item={activeSnack} onClose={() => setActiveSnack(null)} />
+        <SnackbarStack />
       </div>
     </main>
   );
@@ -435,17 +493,18 @@ function Header({ onHome }) {
   const dark = theme === DARK_THEME;
   return (
     <header className="mb-4 flex items-center justify-between gap-3 border-b border-[var(--line)] pb-4">
-      <button className="flex items-center gap-3 text-left" onClick={onHome} title="Go home">
+      <button className="flex items-center gap-3 text-left" onClick={onHome} title="Go home" aria-label="Sudostrike Home">
         <div className="grid size-11 place-items-center rounded-lg bg-[var(--accent)] text-[var(--accentText)] shadow-glow">
           <Sparkles size={21} />
         </div>
         <div>
-          <h1 className="text-xl font-semibold tracking-normal">Sudoku Versus</h1>
+          <h1 className="text-xl font-semibold tracking-normal">Sudostrike</h1>
           <p className="text-sm text-[var(--muted)]">Real-time competitive Sudoku</p>
         </div>
       </button>
       <div className="flex items-center gap-2">
         <select
+          aria-label="Color Theme"
           className="h-10 rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 text-sm outline-none"
           value={theme}
           onChange={(event) => setTheme(event.target.value)}
@@ -461,11 +520,13 @@ function Header({ onHome }) {
 }
 
 function ThemeIcon({ dark, onToggle }) {
+  const label = dark ? "Switch to light mode" : "Switch to dark mode";
   return (
     <button
       className="grid size-10 place-items-center rounded-md border border-[var(--line)] bg-[var(--panel)] text-[var(--muted)]"
       onClick={onToggle}
-      title={dark ? "Switch to light mode" : "Switch to dark mode"}
+      title={label}
+      aria-label={label}
     >
       {dark ? <Moon size={18} /> : <Sun size={18} />}
     </button>
@@ -482,7 +543,7 @@ function Home() {
   const getDailyBoard = useGame((s) => s.getDailyBoard);
   const [difficulty, setDifficulty] = useState("Medium");
   const [code, setCode] = useState("");
-  const [missing, setMissing] = useState(false);
+  const [joinError, setJoinError] = useState(null);
   const [selectedDate, setSelectedDate] = useState(() => toDateKey(new Date()));
   const [monthCursor, setMonthCursor] = useState(() => {
     const d = new Date();
@@ -513,7 +574,7 @@ function Home() {
             Create a room, share the code, wait for everyone to ready up, then solve the same puzzle at the same time.
           </p>
         </div>
-          <div className="grid gap-3 sm:grid-cols-2">
+        <div className="grid gap-3 sm:grid-cols-2">
           <div className="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-4">
             <label className="mb-2 block text-sm font-medium text-[var(--muted)]">Difficulty</label>
             <select
@@ -538,7 +599,7 @@ function Home() {
               className="mb-4 h-11 w-full rounded-md border border-[var(--line)] bg-[var(--soft)] px-3 uppercase outline-none"
               value={code}
               onChange={(event) => {
-                setMissing(false);
+                setJoinError(null);
                 setCode(event.target.value.toUpperCase());
               }}
               placeholder="ABC123"
@@ -546,13 +607,31 @@ function Home() {
             <button
               className="btn-secondary w-full"
               onClick={async () => {
-                const ok = await joinRoom(code);
-                setMissing(!ok);
+                const res = await joinRoom(code);
+                if (!res?.ok) {
+                  setJoinError(res?.reason || "not_found");
+                } else {
+                  setJoinError(null);
+                }
               }}
             >
               <LogOut size={18} /> Join Room
             </button>
-            {missing && <p className="mt-2 text-sm text-[var(--danger)]">Room code not found on this device.</p>}
+            {joinError === "not_found" && (
+              <p className="mt-2 text-sm text-[var(--danger)]">Room code not found. Check the code and try again.</p>
+            )}
+            {joinError === "full" && (
+              <p className="mt-2 text-sm text-[var(--danger)]">This room is full (maximum 8 players reached).</p>
+            )}
+            {joinError === "kicked" && (
+              <p className="mt-2 text-sm text-[var(--danger)]">You were kicked from this room.</p>
+            )}
+            {joinError === "offline" && (
+              <p className="mt-2 text-sm text-[var(--danger)]">Could not connect to server. Check your connection.</p>
+            )}
+            {joinError === "invalid_code" && (
+              <p className="mt-2 text-sm text-[var(--danger)]">Please enter a valid room code.</p>
+            )}
           </div>
         </div>
         <div className="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-4">
@@ -563,6 +642,7 @@ function Home() {
           <div className="mb-3 flex items-center justify-between gap-2">
             <button
               className="btn-secondary h-9 px-3"
+              aria-label="Previous month"
               onClick={() => setMonthCursor((m) => new Date(m.getFullYear(), m.getMonth() - 1, 1))}
             >
               Prev
@@ -572,6 +652,7 @@ function Home() {
             </p>
             <button
               className="btn-secondary h-9 px-3"
+              aria-label="Next month"
               onClick={() => setMonthCursor((m) => new Date(m.getFullYear(), m.getMonth() + 1, 1))}
             >
               Next
@@ -589,13 +670,15 @@ function Home() {
               const status = dailyProgress[key]?.status || "not_started";
               const selected = key === selectedDate;
               const statusClass = status === "solved" ? "bg-[var(--good)]" : status === "in_progress" ? "bg-[var(--accent)]" : "bg-[var(--line)]";
+              const readableStatus = status === "solved" ? "solved" : status === "in_progress" ? "in progress" : "not started";
               return (
                 <button
                   key={key}
                   disabled={isFutureDateKey(key)}
                   className={`relative h-11 rounded-md border text-sm ${selected ? "border-[var(--accent)] bg-[var(--soft)]" : "border-[var(--line)] bg-[var(--panel)]"} ${status === "solved" ? "ring-1 ring-[var(--good)]/50" : ""}`}
                   onClick={() => setSelectedDate(key)}
-                  title={`${key} - ${status}`}
+                  title={`${key} - ${readableStatus}`}
+                  aria-label={`${key}, ${readableStatus}`}
                 >
                   <span className={status === "solved" ? "font-semibold text-[var(--good)]" : ""}>{date.getDate()}</span>
                   {status === "solved" && (
@@ -656,7 +739,7 @@ function StatsPanel({ stats }) {
           {Object.keys(difficulties).map((difficulty) => (
             <div key={difficulty} className="flex justify-between border-b border-[var(--line)] py-2 text-sm">
               <span>{difficulty}</span>
-              <span className="text-[var(--muted)]">{stats.bestTimes[difficulty] ? formatTime(stats.bestTimes[difficulty]) : "..."}</span>
+              <span className="text-[var(--muted)]">{stats.bestTimes?.[difficulty] ? formatTime(stats.bestTimes[difficulty]) : "..."}</span>
             </div>
           ))}
         </div>
@@ -729,8 +812,12 @@ function DailyPlay() {
   const board = snapshot.board;
   const notes = snapshot.notes;
   const selectedValue = dailySelected === null ? null : board[dailySelected];
-  const elapsedMs = (progress.elapsedMs || 0) + (progress.status !== "solved" ? Math.max(0, now() - (dailyStartedAt || now())) : 0);
-  const counts = Array.from({ length: 10 }, (_, n) => board.reduce((total, value) => total + (value === n ? 1 : 0), 0));
+  const elapsedMs =
+    (progress.elapsedMs || 0) +
+    (!dailyPaused && progress.status !== "solved" && !progress.solvedAt && dailyStartedAt
+      ? Math.max(0, now() - dailyStartedAt)
+      : 0);
+  const counts = Array.from({ length: 10 }, (_, n) => board.reduce((total, value, idx) => total + (value === n && dailyBoard.solution[idx] === n ? 1 : 0), 0));
   const mistakes = progress.mistakes || 0;
   const progressPercent = Math.round((board.filter(Boolean).length / 81) * 100);
   const shareLink = `${window.location.origin}${window.location.pathname}?daily=${encodeURIComponent(dailyDateKey)}`;
@@ -763,13 +850,13 @@ function DailyPlay() {
                 <p className="font-semibold text-[var(--text)]">{Math.max(0, 2 - (progress.hintsUsed || 0))}</p>
               </div>
             </div>
-            <button className="icon-btn absolute right-3 top-3 sm:static sm:justify-self-end" onClick={leaveDaily} title="Back home">
+            <button className="icon-btn absolute right-3 top-3 sm:static sm:justify-self-end" onClick={leaveDaily} title="Back home" aria-label="Back home">
               <LogOut size={18} />
             </button>
           </div>
         </div>
         <div id="daily-board-anchor" className="relative mx-auto w-full max-w-[min(92vw,660px)]">
-          <div className={`sudoku-grid ${dailyPaused ? "blur-md" : ""}`}>
+          <div className={`sudoku-grid ${dailyPaused ? "blur-md" : ""}`} role="grid" aria-label="Sudoku board">
             {board.map((value, idx) => {
               const fixed = Boolean(dailyBoard.puzzle[idx]);
               const row = Math.floor(idx / 9);
@@ -782,9 +869,14 @@ function DailyPlay() {
                 Math.floor((dailySelected % 9) / 3) === Math.floor(col / 3);
               const sameNumber = selectedValue && value === selectedValue;
               const wrongEntry = !fixed && value && value !== dailyBoard.solution[idx];
+              const cellLabel = `row ${row + 1} column ${col + 1}${value ? `, ${value}` : ""}${fixed ? ", fixed" : ""}${wrongEntry ? ", incorrect" : ""}`;
               return (
                 <button
                   key={idx}
+                  role="gridcell"
+                  aria-label={cellLabel}
+                  aria-selected={idx === dailySelected}
+                  tabIndex={idx === (dailySelected ?? 0) ? 0 : -1}
                   className={["cell", fixed ? "fixed" : "", idx === dailySelected ? "selected" : "", sameRow || sameCol || sameBox ? "peer" : "", sameNumber ? "same" : "", wrongEntry ? "wrong" : ""].join(" ")}
                   onPointerDown={(event) => event.preventDefault()}
                   onClick={() => setDailySelected(idx)}
@@ -814,18 +906,22 @@ function DailyPlay() {
           )}
         </div>
         <div className="mx-auto grid w-full max-w-[min(92vw,660px)] grid-cols-9 gap-1.5 sm:gap-2">
-          {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => (
-            <button
-              key={n}
-              className={counts[n] >= 9 ? "number-btn number-done" : "number-btn"}
-              onPointerDown={(event) => event.preventDefault()}
-              onClick={() => pushMove(n)}
-              disabled={counts[n] >= 9 || dailyPaused}
-            >
-              <span className="text-lg font-semibold leading-none">{n}</span>
-              <span className="text-[10px] font-medium opacity-80">{counts[n]}/9</span>
-            </button>
-          ))}
+          {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => {
+            const done = digitIsComplete(board, dailyBoard.solution, n);
+            return (
+              <button
+                key={n}
+                aria-label={`Digit ${n}, ${counts[n]} of 9 placed`}
+                className={done ? "number-btn number-done" : "number-btn"}
+                onPointerDown={(event) => event.preventDefault()}
+                onClick={() => pushMove(n)}
+                disabled={done || dailyPaused}
+              >
+                <span className="text-lg font-semibold leading-none">{n}</span>
+                <span className="text-[10px] font-medium opacity-80">{counts[n]}/9</span>
+              </button>
+            );
+          })}
         </div>
         <div className="mb-4 rounded-lg border border-[var(--line)] bg-[var(--panel)] p-3">
           <div className="mb-3 flex items-center justify-between gap-3">
@@ -839,21 +935,21 @@ function DailyPlay() {
             </div>
           </div>
           <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center">
-            <button className="icon-btn h-10 w-full sm:h-12 sm:w-12 sm:p-0" onClick={undo} title="Undo">
+            <button className="icon-btn h-10 w-full sm:h-12 sm:w-12 sm:p-0" onClick={undo} title="Undo" aria-label="Undo">
               <RotateCcw size={18} />
             </button>
-            <button className="icon-btn h-10 w-full sm:h-12 sm:w-12 sm:p-0" onClick={erase} title="Erase">
+            <button className="icon-btn h-10 w-full sm:h-12 sm:w-12 sm:p-0" onClick={erase} title="Erase" aria-label="Erase">
               <Trash2 size={18} />
             </button>
             <button className={dailyInputMode === "note" ? "btn-primary h-10 w-full sm:w-auto" : "btn-secondary h-10 w-full sm:w-auto"} onClick={() => setDailyInputMode(dailyInputMode === "value" ? "note" : "value")}>
               <Pencil size={17} /> {dailyInputMode === "note" ? "Notes" : "Values"}
             </button>
             <button
-              className="btn-secondary h-10 w-full cursor-not-allowed opacity-60 pointer-events-none sm:w-auto"
-              onClick={undefined}
-              disabled
-              aria-disabled="true"
-              title="Hint temporarily disabled"
+              className="btn-secondary h-10 w-full disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
+              onClick={useHint}
+              disabled={Math.max(0, 2 - (progress.hintsUsed || 0)) === 0 || dailyPaused || progress.status === "solved"}
+              title={`Hint (${Math.max(0, 2 - (progress.hintsUsed || 0))} left)`}
+              aria-label={`Hint (${Math.max(0, 2 - (progress.hintsUsed || 0))} left)`}
             >
               <Lightbulb size={17} /> Hint {Math.max(0, 2 - (progress.hintsUsed || 0))}
             </button>
@@ -925,10 +1021,35 @@ function Room() {
   const publish = useGame((s) => s.publish);
   const leaveRoom = useGame((s) => s.leaveRoom);
   const kickPlayer = useGame((s) => s.kickPlayer);
+  const inputMode = useGame((s) => s.inputMode);
+  const setInputMode = useGame((s) => s.setInputMode);
+  const togglePause = useGame((s) => s.togglePause);
+  const undo = useGame((s) => s.undo);
+  const erase = useGame((s) => s.erase);
+  const useHint = useGame((s) => s.useHint);
   const [nameDraft, setNameDraft] = useState(player.name || "");
+  const viewingId = useGame((s) => s.viewingId);
   const me = room.players?.[player.id];
+  const viewedPlayer = (viewingId && room.players?.[viewingId]) || me;
   const activePlayers = Object.values(room.players || {}).filter((p) => p.status === "active");
   const isLobby = room.status === "lobby";
+  const hasOpponents = Object.values(room.players || {}).some((p) => p.id !== player.id);
+  const isPaused = Boolean(room.pausedAt);
+  const voteMap = isPaused ? (room.resumeRequests || {}) : (room.pauseRequests || {});
+  const pauseVoters = getPauseVoterIds(room);
+  const voteBaseIds = isPaused
+    ? ((room.pausedByIds && room.pausedByIds.length > 0)
+      ? room.pausedByIds.filter((id) => pauseVoters.includes(id))
+      : pauseVoters)
+    : pauseVoters;
+  const electorate = voteBaseIds.length > 0 ? voteBaseIds : pauseVoters;
+  const voteCount = electorate.filter((id) => Boolean(voteMap[id])).length;
+  const hintsLeft = Math.max(0, 2 - (me?.hintsUsed || 0));
+  const progressPercent = me ? boardProgress(me.board, room.solution) : 0;
+  const standing = me ? matchStanding(room, player.id)?.label || "Solo" : "Solo";
+  const boardLocked = !me || isPaused || room.status === "countdown" ||
+    me.status === "spectating" || me.status === "lost" || me.status === "winner" ||
+    (room.status === "ended" && me.status !== "continue");
 
   useEffect(() => {
     setNameDraft(player.name || "");
@@ -945,27 +1066,22 @@ function Room() {
   useEffect(() => {
     if (!room || room.players?.[player.id]) return;
     if (room.kickedIds?.[player.id]) return;
-    const repaired = {
+    // Never publish a "repaired" room built from a malformed relay payload.
+    if (!Array.isArray(room.puzzle) || room.puzzle.length !== 81) return;
+    if (!Array.isArray(room.solution) || room.solution.length !== 81) return;
+    const repaired = normalizeRoom({
       ...room,
       players: {
         ...room.players,
-        [player.id]: {
+        [player.id]: createPlayer({
           ...player,
+          puzzle: room.puzzle,
           ready: false,
           connected: true,
-          status: "active",
-          mistakes: 0,
-          progress: 0,
-          finishedMs: null,
-          personalSolvedAt: null,
-          personalSolvedDismissed: false,
-          board: [...room.puzzle],
-          notes: blankNotes(),
-          lastSeen: now(),
-        },
+        }),
       },
-    };
-    publish(repaired);
+    });
+    if (repaired) publish(repaired);
   }, [room, player, publish]);
 
   if (!me) {
@@ -980,9 +1096,31 @@ function Room() {
         ) : (
           <>
             <CountdownOverlay />
+            <SpectatorBanner />
+            <MatchStatusBar
+              room={room}
+              viewedPlayer={viewedPlayer}
+              mistakes={Math.min((viewedPlayer || me).mistakes || 0, 3)}
+              progress={viewedPlayer ? boardProgress(viewedPlayer.board, room.solution) : progressPercent}
+              standing={standing}
+              paused={isPaused}
+            />
             <Board />
             <NumberPad />
-            <GameTopbar />
+            <GameActionBar
+              inputMode={inputMode}
+              onToggleNotes={() => setInputMode(inputMode === "value" ? "note" : "value")}
+              onUndo={undo}
+              onErase={erase}
+              onHint={useHint}
+              hintsLeft={hintsLeft}
+              onPause={togglePause}
+              paused={isPaused}
+              pauseBadge={voteCount}
+              disableBoardActions={boardLocked}
+              disableHint={boardLocked || hintsLeft === 0}
+              disablePause={me.status === "spectating"}
+            />
             <ContinueSolvedDialog />
             <WinnerChampionOverlay />
           </>
@@ -996,7 +1134,7 @@ function Room() {
               <p className="text-2xl font-semibold tracking-normal">{room.code}</p>
               <p className="text-sm text-[var(--muted)]">{room.difficulty} · {activePlayers.length} active</p>
             </div>
-            <button className="icon-btn" onClick={leaveRoom} title="Leave room">
+            <button className="icon-btn" onClick={leaveRoom} title="Leave room" aria-label="Leave room">
               <LogOut size={18} />
             </button>
           </div>
@@ -1098,7 +1236,7 @@ function Lobby() {
           The shared board unlocks only after every player in the room clicks ready.
         </p>
         <div className="mt-6 grid gap-2">
-          {Object.values(room.players).map((p) => (
+          {Object.values(room.players).filter((p) => p.status !== "left").map((p) => (
             <div key={p.id} className="flex items-center justify-between rounded-md bg-[var(--soft)] px-4 py-3">
               <span>{p.name}</span>
               <span className={p.ready ? "text-[var(--good)]" : "text-[var(--muted)]"}>{p.ready ? "Ready" : "Waiting"}</span>
@@ -1113,96 +1251,181 @@ function Lobby() {
   );
 }
 
-function GameTopbar() {
-  const room = useGame((s) => s.room);
-  const player = useGame((s) => s.player);
-  const inputMode = useGame((s) => s.inputMode);
-  const setInputMode = useGame((s) => s.setInputMode);
-  const togglePause = useGame((s) => s.togglePause);
-  const undo = useGame((s) => s.undo);
-  const erase = useGame((s) => s.erase);
-  const useHint = useGame((s) => s.useHint);
-  const toggleRematchVote = useGame((s) => s.toggleRematchVote);
+function MatchTimerDisplay({ room, viewedPlayer }) {
   const [, setTick] = useState(0);
-  const me = room.players[player.id];
-  const isPaused = Boolean(room.pausedAt);
-  const voteMap = isPaused ? (room.resumeRequests || {}) : (room.pauseRequests || {});
-  const rematchRequests = room.rematchRequests || {};
-  const rematchVoterIds = Object.values(room.players).filter((p) => isPlayerOnline(p)).map((p) => p.id);
-  const rematchVotes = rematchVoterIds.filter((id) => rematchRequests[id]).length;
-  const votedRematch = Boolean(rematchRequests[player.id]);
-  const voted = Boolean(voteMap[player.id]);
-  const voteBaseIds = isPaused
-    ? ((room.pausedByIds && room.pausedByIds.length > 0)
-      ? room.pausedByIds
-      : getPauseVoterIds(room))
-    : getPauseVoterIds(room);
-  const voteCount = voteBaseIds.filter((id) => Boolean(voteMap[id])).length;
   useEffect(() => {
     const interval = setInterval(() => setTick((v) => v + 1), 1000);
     return () => clearInterval(interval);
   }, []);
-
   return (
-    <div className="mb-4 rounded-lg border border-[var(--line)] bg-[var(--panel)] p-3">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <div>
-          <p className="text-sm text-[var(--muted)]">Timer</p>
-          <p className="text-2xl font-semibold tabular-nums">{formatTime(elapsed(room))}</p>
+    <span className="flex items-center gap-1.5 font-semibold tabular-nums" title="Elapsed time">
+      <Timer size={16} className="text-[var(--muted)]" />
+      {formatTime(elapsed(room, viewedPlayer))}
+    </span>
+  );
+}
+
+function MatchStatusBar({ room, viewedPlayer, mistakes, progress, standing, paused }) {
+  return (
+    <div className="sticky top-0 z-30 mb-3 rounded-lg border border-[var(--line)] bg-[var(--panel)] px-3 py-2 shadow-sm">
+      <div className="flex items-center gap-3 text-sm">
+        <MatchTimerDisplay room={room} viewedPlayer={viewedPlayer} />
+        {typeof mistakes === "number" && (
+          <span className="flex items-center gap-1 font-semibold text-[var(--danger)]" title="Mistakes">
+            <X size={15} />
+            {mistakes}/3
+          </span>
+        )}
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <span className="font-semibold">{progress}%</span>
+            <span className="truncate text-[var(--muted)]">{standing}</span>
+          </div>
+          <div
+            className="mt-1 h-1.5 overflow-hidden rounded-full bg-[var(--soft)]"
+            role="progressbar"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={progress}
+            aria-label="Board progress"
+          >
+            <div
+              className="h-full rounded-full bg-[var(--accent)] transition-[width] duration-300"
+              style={{ width: `${progress}%` }}
+            />
+          </div>
         </div>
-        <div className="text-right">
-          <p className="text-sm text-[var(--muted)]">Mistakes</p>
-          <p className="text-2xl font-semibold text-[var(--danger)]">{Math.min(me.mistakes, 3)}/3</p>
-        </div>
-      </div>
-      <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center">
-        <button className="icon-btn h-10 w-full sm:h-12 sm:w-12 sm:p-0" onClick={undo} title="Undo">
-          <RotateCcw size={18} />
-        </button>
-        <button className="icon-btn h-10 w-full sm:h-12 sm:w-12 sm:p-0" onClick={erase} title="Erase">
-          <Trash2 size={18} />
-        </button>
-        <button
-          className={inputMode === "note" ? "btn-primary h-10 w-full sm:w-auto" : "btn-secondary h-10 w-full sm:w-auto"}
-          onClick={() => setInputMode(inputMode === "value" ? "note" : "value")}
-        >
-          <Pencil size={17} /> {inputMode === "note" ? "Notes" : "Values"}
-        </button>
-        <button
-          className="btn-secondary h-10 w-full cursor-not-allowed opacity-60 pointer-events-none sm:w-auto"
-          onClick={undefined}
-          title="Hint temporarily disabled"
-          disabled
-          aria-disabled="true"
-        >
-          <Lightbulb size={17} /> Hint {Math.max(0, 2 - (me.hintsUsed || 0))}
-        </button>
-        <button className={voted ? "btn-primary h-10 w-full sm:w-auto" : "btn-secondary h-10 w-full sm:w-auto"} onClick={togglePause}>
-          {isPaused ? <Play size={17} /> : <Pause size={17} />} {isPaused ? "Resume" : "Pause"} {voteCount}
-        </button>
-        <button className={votedRematch ? "btn-primary h-10 w-full sm:w-auto" : "btn-secondary h-10 w-full sm:w-auto"} onClick={toggleRematchVote}>
-          <RotateCcw size={17} /> Rematch {rematchVotes}/{rematchVoterIds.length}
-        </button>
+        {paused && (
+          <span className="rounded-full bg-[var(--soft)] px-2 py-1 text-xs font-semibold text-[var(--muted)]">
+            Paused
+          </span>
+        )}
       </div>
     </div>
   );
 }
 
-function Board() {
+function ActionButton({ label, icon, badge, active, disabled, onClick, title }) {
+  return (
+    <button
+      className={[
+        "flex h-12 flex-col items-center justify-center gap-0.5 rounded-md border text-[10px] font-semibold transition active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-45",
+        active
+          ? "border-[var(--accent)] bg-[var(--soft)] text-[var(--text)]"
+          : "border-[var(--line)] bg-[var(--panel)] text-[var(--muted)]",
+      ].join(" ")}
+      onClick={onClick}
+      disabled={disabled}
+      title={title || label}
+      aria-label={title || label}
+    >
+      <span className="relative">
+        {icon}
+        {typeof badge === "number" && badge > 0 && (
+          <span className="absolute -right-2 -top-1 grid min-w-4 place-items-center rounded-full bg-[var(--accent)] px-1 text-[9px] font-bold leading-4 text-[var(--accentText)]">
+            {badge}
+          </span>
+        )}
+      </span>
+      <span>{label}</span>
+    </button>
+  );
+}
+
+function GameActionBar({
+  inputMode,
+  onToggleNotes,
+  onUndo,
+  onErase,
+  onHint,
+  hintsLeft,
+  onPause,
+  paused,
+  pauseBadge,
+  disableBoardActions,
+  disableHint,
+  disablePause,
+}) {
+  return (
+    <div className="sticky bottom-0 z-30 mt-3 rounded-lg border border-[var(--line)] bg-[var(--panel)] p-1.5 shadow-sm sm:static">
+      <div className="grid grid-cols-5 gap-1.5">
+        <ActionButton
+          label="Undo"
+          icon={<RotateCcw size={18} />}
+          onClick={onUndo}
+          disabled={disableBoardActions}
+        />
+        <ActionButton
+          label="Erase"
+          icon={<Trash2 size={18} />}
+          onClick={onErase}
+          disabled={disableBoardActions}
+        />
+        <ActionButton
+          label={inputMode === "note" ? "Notes" : "Values"}
+          icon={<Pencil size={18} />}
+          onClick={onToggleNotes}
+          active={inputMode === "note"}
+        />
+        <ActionButton
+          label="Hint"
+          icon={<Lightbulb size={18} />}
+          badge={hintsLeft}
+          onClick={onHint}
+          disabled={disableHint}
+          title={hintsLeft > 0 ? `Hint (${hintsLeft} left)` : "No hints left"}
+        />
+        <ActionButton
+          label={paused ? "Resume" : "Pause"}
+          icon={paused ? <Play size={18} /> : <Pause size={18} />}
+          badge={pauseBadge}
+          onClick={onPause}
+          disabled={disablePause}
+          active={paused}
+        />
+      </div>
+    </div>
+  );
+}
+
+function SpectatorBanner() {
+  const room = useGame((s) => s.room);
+  const player = useGame((s) => s.player);
+  const viewingId = useGame((s) => s.viewingId);
+  const resumeOwnBoard = useGame((s) => s.resumeOwnBoard);
+  const me = room?.players?.[player.id];
+  if (!me || me.status !== "spectating") return null;
+  const viewed = room.players[viewingId];
+  const watching = !viewed ? "another player" : viewed.id === player.id ? "your board" : viewed.name;
+  return (
+    <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[var(--accent)] bg-[var(--soft)] px-3 py-2 text-sm">
+      <span className="flex items-center gap-2">
+        <Eye size={16} className="text-[var(--accent)]" />
+        Spectating {watching}
+      </span>
+      <button className="btn-secondary h-9" onClick={resumeOwnBoard}>
+        <Play size={15} /> Back to my board
+      </button>
+    </div>
+  );
+}
+
+const Board = React.memo(function Board() {
   const room = useGame((s) => s.room);
   const player = useGame((s) => s.player);
   const selected = useGame((s) => s.selected);
   const setSelected = useGame((s) => s.setSelected);
+  const forceResume = useGame((s) => s.forceResume);
   const viewingId = useGame((s) => s.viewingId) || player.id;
   const viewed = room.players[viewingId] || room.players[player.id];
   const me = room.players[player.id];
   const selectedValue = selected === null ? null : viewed.board[selected];
   const paused = Boolean(room.pausedAt);
-  const canEdit = viewed.id === player.id && me.status !== "spectating" && me.status !== "lost";
+  const canEdit = viewed.id === player.id && me.status !== "spectating" && me.status !== "lost" && room.winnerId !== player.id;
 
   return (
     <div id="room-board-anchor" className="relative mx-auto max-w-[min(92vw,660px)]">
-      <div className={`sudoku-grid ${paused ? "blur-md" : ""}`}>
+      <div className={`sudoku-grid ${paused ? "blur-md" : ""}`} role="grid" aria-label="Sudoku board">
         {viewed.board.map((value, idx) => {
           const fixed = Boolean(room.puzzle[idx]);
           const row = Math.floor(idx / 9);
@@ -1215,9 +1438,14 @@ function Board() {
             Math.floor((selected % 9) / 3) === Math.floor(col / 3);
           const sameNumber = selectedValue && value === selectedValue;
           const wrongEntry = !fixed && value && value !== room.solution[idx];
+          const cellLabel = `row ${row + 1} column ${col + 1}${value ? `, ${value}` : ""}${fixed ? ", fixed" : ""}${wrongEntry ? ", incorrect" : ""}`;
           return (
             <button
               key={idx}
+              role="gridcell"
+              aria-label={cellLabel}
+              aria-selected={idx === selected}
+              tabIndex={idx === (selected ?? 0) ? 0 : -1}
               className={[
                 "cell",
                 fixed ? "fixed" : "",
@@ -1249,48 +1477,79 @@ function Board() {
             <Pause className="mx-auto mb-3" size={40} />
             <p className="text-2xl font-semibold">Paused</p>
             <p className="text-sm text-[var(--muted)]">The board is hidden until active players resume.</p>
+            {room.ownerId === player.id && (
+              <button className="btn-secondary mt-3 text-xs" onClick={forceResume}>
+                Host Force Resume
+              </button>
+            )}
           </div>
         </div>
       )}
     </div>
   );
-}
+});
 
-function NumberPad() {
+const NumberPad = React.memo(function NumberPad() {
   const room = useGame((s) => s.room);
   const player = useGame((s) => s.player);
+  const viewingId = useGame((s) => s.viewingId);
   const pushMove = useGame((s) => s.pushMove);
   const me = room?.players?.[player.id];
-  const board = me?.board || [];
-  const counts = Array.from({ length: 10 }, (_, n) => board.reduce((total, value) => total + (value === n ? 1 : 0), 0));
+  const board = me?.board;
+  // Stable reference: a new array each render used to re-run the effect below,
+  // which cleared the flash timer before it could fire.
+  const counts = React.useMemo(
+    () =>
+      Array.from({ length: 10 }, (_, n) =>
+        (board || []).reduce(
+          (total, value, idx) => total + (value === n && room?.solution?.[idx] === n ? 1 : 0),
+          0,
+        ),
+      ),
+    [board],
+  );
+  const completed = React.useMemo(
+    () => [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => digitIsComplete(board, room?.solution, n)),
+    [board, room?.solution],
+  );
   const [flash, setFlash] = useState(null);
-  const prevCounts = React.useRef(counts);
+  const prevCompleted = React.useRef(completed);
 
   useEffect(() => {
-    const newlyCompleted = [1, 2, 3, 4, 5, 6, 7, 8, 9].find((n) => prevCounts.current[n] < 9 && counts[n] >= 9);
-    if (newlyCompleted) {
-      setFlash(newlyCompleted);
-      const timer = setTimeout(() => setFlash(null), 800);
-      prevCounts.current = counts;
-      return () => clearTimeout(timer);
-    }
-    prevCounts.current = counts;
-    return undefined;
-  }, [counts]);
+    const newlyCompleted = completed.findIndex((done, idx) => done && !prevCompleted.current[idx]);
+    prevCompleted.current = completed;
+    if (newlyCompleted === -1) return undefined;
+    setFlash(newlyCompleted + 1);
+    const timer = setTimeout(() => setFlash(null), 800);
+    return () => clearTimeout(timer);
+  }, [completed]);
+
+  if (!me) return null;
+  const paused = Boolean(room.pausedAt);
+  const canEdit =
+    (viewingId || player.id) === player.id &&
+    me.status !== "spectating" &&
+    me.status !== "lost" &&
+    me.status !== "winner" &&
+    room.winnerId !== player.id &&
+    !paused &&
+    room.status !== "countdown" &&
+    !(room.status === "ended" && me.status !== "continue");
 
   return (
     <div className="mx-auto grid max-w-[min(92vw,660px)] grid-cols-9 gap-2">
       {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => (
         <button
           key={n}
+          aria-label={`Digit ${n}, ${counts[n]} of 9 placed`}
           className={[
             "number-btn",
-            counts[n] >= 9 ? "number-done" : "",
+            completed[n - 1] ? "number-done" : "",
             flash === n ? "number-flash" : "",
           ].join(" ")}
           onPointerDown={(event) => event.preventDefault()}
           onClick={() => pushMove(n)}
-          disabled={counts[n] >= 9}
+          disabled={!canEdit || completed[n - 1]}
         >
           <span className="text-lg font-semibold leading-none">{n}</span>
           <span className="text-[10px] font-medium opacity-80">{counts[n]}/9</span>
@@ -1298,13 +1557,18 @@ function NumberPad() {
       ))}
     </div>
   );
-}
+});
 
 function PlayersPanel() {
   const room = useGame((s) => s.room);
   const viewingId = useGame((s) => s.viewingId);
   const setViewingId = useGame((s) => s.setViewingId);
-  const players = Object.values(room.players);
+  const [, setPresenceTick] = useState(0);
+  useEffect(() => {
+    const interval = setInterval(() => setPresenceTick((v) => v + 1), 2500);
+    return () => clearInterval(interval);
+  }, []);
+  const players = Object.values(room.players).filter((p) => p.status !== "left");
   return (
     <div className="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-4">
       <div className="mb-3 flex items-center gap-2">
@@ -1322,7 +1586,7 @@ function PlayersPanel() {
             >
               <div className="mb-2 flex items-center justify-between gap-2">
                 <span className="flex items-center gap-2 font-medium">
-                  {p.status === "winner" ? <Crown size={16} className="text-[var(--gold)]" /> : <Eye size={16} className="text-[var(--muted)]" />}
+                  {p.id === room.winnerId ? <Crown size={16} className="text-[var(--gold)]" /> : <Eye size={16} className="text-[var(--muted)]" />}
                   {p.name}
                 </span>
                 <span className="flex items-center gap-2">
@@ -1363,17 +1627,22 @@ function EndDialog() {
   const rematchVoterIds = Object.values(room.players).filter((p) => isPlayerOnline(p)).map((p) => p.id);
   const rematchVotes = rematchVoterIds.filter((id) => rematchRequests[id]).length;
   const votedRematch = Boolean(rematchRequests[player.id]);
-  const show = room.status === "ended" && me.status !== "continue";
   const lostByMistakes = me.status === "lost" && !me.lossPromptDismissed;
+  const matchEnded = room.status === "ended";
+  const show = (matchEnded && me.status !== "continue" && me.status !== "spectating") || lostByMistakes;
+  const offerSpectate = lostByMistakes && !matchEnded;
 
   return (
     <AnimatePresence>
-      {(show || lostByMistakes) && (
+      {show && (
         <motion.div
           className="fixed inset-0 z-50 grid place-items-center bg-black/55 p-4 backdrop-blur-sm"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="end-dialog-title"
         >
           <motion.div
             className="w-full max-w-md rounded-lg border border-[var(--line)] bg-[var(--panel)] p-6 text-center shadow-2xl"
@@ -1381,17 +1650,17 @@ function EndDialog() {
             animate={{ scale: 1, y: 0 }}
           >
             <Crown className="mx-auto mb-3 text-[var(--gold)]" size={42} />
-            <h2 className="text-2xl font-semibold tracking-normal">
-              {me.status === "winner" ? "You won" : lostByMistakes ? "You lost the match" : "Match over"}
+            <h2 id="end-dialog-title" className="text-2xl font-semibold tracking-normal">
+              {me.status === "winner" ? "You won" : offerSpectate ? "You lost the match" : "Match over"}
             </h2>
             <p className="mt-2 text-[var(--muted)]">
-              {lostByMistakes
+              {offerSpectate
                 ? "You reached 3 mistakes. You can keep solving for yourself or spectate an opponent."
                 : winner
                   ? `${winner.name} finished first.`
-                  : "You can spectate the remaining active players."}
+                  : "You can continue solving for yourself or vote for a rematch."}
             </p>
-            {lostByMistakes ? (
+            {offerSpectate ? (
               <div className="mt-5 grid gap-2 sm:grid-cols-2">
                 <button className="btn-primary w-full" onClick={continueMode}>
                   <Play size={18} /> Continue
@@ -1431,6 +1700,9 @@ function ContinueSolvedDialog() {
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         exit={{ opacity: 0 }}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="continue-dialog-title"
       >
         <motion.div
           className="w-full max-w-md rounded-lg border border-[var(--line)] bg-[var(--panel)] p-6 text-center shadow-2xl"
@@ -1438,7 +1710,7 @@ function ContinueSolvedDialog() {
           animate={{ scale: 1, y: 0 }}
         >
           <Check className="mx-auto mb-3 text-[var(--good)]" size={42} />
-          <h2 className="text-2xl font-semibold tracking-normal">Board completed</h2>
+          <h2 id="continue-dialog-title" className="text-2xl font-semibold tracking-normal">Board completed</h2>
           <p className="mt-2 text-[var(--muted)]">
             You solved your board in continue mode at {formatTime(me.personalSolvedAt)}.
           </p>
@@ -1498,12 +1770,13 @@ function DailyCompletionOverlay() {
   const progress = dailyProgress[dailyDateKey] || {};
   useEffect(() => {
     if (mode !== "daily" || progress.status !== "solved" || !dailyDateKey) return;
-    if (shownRef.current === dailyDateKey) return;
-    shownRef.current = dailyDateKey;
+    const celebrationKey = `${dailyDateKey}:${progress.solvedAt || "solved"}`;
+    if (shownRef.current === celebrationKey) return;
+    shownRef.current = celebrationKey;
     setShow(true);
     const timer = setTimeout(() => setShow(false), 3600);
     return () => clearTimeout(timer);
-  }, [mode, progress.status, dailyDateKey]);
+  }, [mode, progress.status, progress.solvedAt, dailyDateKey]);
   if (!show) return null;
   return (
     <AnimatePresence>
@@ -1544,13 +1817,14 @@ function WinnerChampionOverlay() {
   const shownWinRef = React.useRef("");
   useEffect(() => {
     if (room?.winnerId !== player.id) return;
-    if (shownWinRef.current === `${room.code}:${room.winnerId}`) return;
-    shownWinRef.current = `${room.code}:${room.winnerId}`;
+    const celebrationKey = `${room.code}:${room.winnerId}:${room.seed || "seed"}`;
+    if (shownWinRef.current === celebrationKey) return;
+    shownWinRef.current = celebrationKey;
     setClosedManually(false);
     setShow(true);
     const timer = setTimeout(() => setShow(false), 3600);
     return () => clearTimeout(timer);
-  }, [room?.code, room?.winnerId, player.id]);
+  }, [room?.code, room?.winnerId, room?.seed, player.id]);
   if (!show || closedManually) return null;
   return (
     <AnimatePresence>
@@ -1598,27 +1872,37 @@ function WinnerChampionOverlay() {
   );
 }
 
-function SnackbarStack({ item, onClose }) {
-  if (!item) return null;
+function SnackbarStack() {
+  const snacks = useGame((s) => s.snacks);
+  const removeSnack = useGame((s) => s.removeSnack);
+  if (!snacks || !snacks.length) return null;
   return (
-    <div className="pointer-events-none fixed bottom-4 left-1/2 z-50 flex w-full max-w-xl -translate-x-1/2 flex-col gap-2 px-4">
+    <div
+      role="region"
+      aria-label="Notifications"
+      aria-live="polite"
+      className="pointer-events-none fixed bottom-4 left-1/2 z-50 flex w-full max-w-xl -translate-x-1/2 flex-col gap-2 px-4"
+    >
       <AnimatePresence>
-        <motion.div
-          key={item.id}
-          initial={{ opacity: 0, y: 18, scale: 0.98 }}
-          animate={{ opacity: 1, y: 0, scale: 1 }}
-          exit={{ opacity: 0, y: 18, scale: 0.98 }}
-          className="pointer-events-auto flex items-center justify-between gap-3 rounded-md border border-[var(--line)] bg-[var(--panel)] px-4 py-3 text-sm shadow-lg"
-        >
-          <span>{item.text}</span>
-          <button
-            className="grid size-7 place-items-center rounded-md border border-[var(--line)] bg-[var(--soft)]"
-            onClick={onClose}
-            title="Close notification"
+        {snacks.map((item) => (
+          <motion.div
+            key={item.id}
+            initial={{ opacity: 0, y: 18, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 18, scale: 0.98 }}
+            className="pointer-events-auto flex items-center justify-between gap-3 rounded-md border border-[var(--line)] bg-[var(--panel)] px-4 py-3 text-sm shadow-lg"
           >
-            <X size={14} />
-          </button>
-        </motion.div>
+            <span>{item.text}</span>
+            <button
+              className="grid size-7 place-items-center rounded-md border border-[var(--line)] bg-[var(--soft)]"
+              onClick={() => removeSnack(item.id)}
+              title="Close notification"
+              aria-label="Close notification"
+            >
+              <X size={14} />
+            </button>
+          </motion.div>
+        ))}
       </AnimatePresence>
     </div>
   );

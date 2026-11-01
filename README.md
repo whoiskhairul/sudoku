@@ -1,39 +1,45 @@
-# Sudoku
+# Sudostrike
 
-> A clean, responsive Sudoku web game built with React, Vite, and Tailwind.
+> Real-time competitive multiplayer Sudoku and daily challenge web app built with React 19, Vite, Zustand, and WebSockets.
 
-Sudoku is a classic single-player logic puzzle implemented as a modern web app. This project provides a responsive UI, puzzle generation, keyboard support, and helpful gameplay tools (hints, pencil marks, undo, and timer).
+Sudostrike is a fast, modern Sudoku application featuring real-time multiplayer racing, a daily calendar puzzle mode, solo play, and extensive keyboard and accessibility support.
 
-## Features
+---
 
-- Multiple difficulty levels (Easy, Medium, Hard, Expert)
-- Puzzle generator with unique-solution puzzles
-- Intuitive keyboard and mouse input
-- Pencil (candidate) marks and quick notes
-- Hints, undo/redo, and puzzle reset
-- Responsive layout for desktop and mobile
-- Save/load your current puzzle in local storage
+## Game Modes
 
-## How to Play
+- **Multiplayer Match:** Create a private room with a 6-character code, share a direct URL or QR code, and race head-to-head in real time. Features live opponent progress tracking, mistake counters, unanimous pause/resume voting, player kicking in lobby, and rematch flow.
+- **Solo Mode:** Instantly jump into a local match to practice or play at your own pace without waiting for a lobby.
+- **Daily Challenge:** A calendar-based daily puzzle deterministically seeded by date, with difficulty rotating across days of the week. Progress, completion times, and mistakes are automatically tracked across the month.
 
-1. Choose a difficulty or load a saved puzzle.
-2. Fill the 9x9 grid so each row, column, and 3x3 box contains the digits 1 through 9 exactly once.
-3. Use pencil mode to jot candidate numbers, use hints for help, and use undo to backtrack.
+---
 
-This app focuses on a smooth, distraction-free Sudoku experience—rules are enforced by the UI to prevent invalid entries.
+## Key Features
+
+- **Guaranteed Unique Puzzles:** Every generated puzzle is verified by a bitmask backtracking solver to ensure exactly one valid solution.
+- **5 Difficulty Levels:** Easy, Medium, Hard, Master, and Extreme.
+- **Input Modes & Notes:** Value placement and pencil (candidate) note-taking with automatic removal of conflicting peer notes.
+- **Mistake Tracking & Hints:** Tracks mistakes per player (3 mistakes results in elimination, with spectate and continue modes available); up to 2 hints available per game.
+- **Themes & Sound:** Four visual themes (Nordic, Cyberpunk, Pastel, Sepia) with light and dark modes. Web Audio sound effects with persistent mute toggle and gesture unlocking.
+- **Local Stats Dashboard:** Tracks games played, wins, losses, win rate, best times per difficulty, and recent mistake trends with a visual chart.
+- **Full Keyboard Navigation:** Navigate the 9x9 grid with arrow keys, enter numbers with 1–9, toggle note mode with Space, undo with Z, and erase with Backspace/Delete.
+
+---
 
 ## Prerequisites
 
-- Node.js 18+ (or a recent LTS release)
-- npm (or yarn)
+- [Node.js](https://nodejs.org/) v18+ (Node.js 20+ recommended)
+- `npm` v9+
 
-## Installation
+---
 
-1. Clone the repository and change into the project folder:
+## Getting Started
+
+1. Clone the repository and enter the project directory:
 
 ```bash
-git clone <your-repo-url>
-cd vibe
+git clone <repository-url>
+cd sudoku
 ```
 
 2. Install dependencies:
@@ -42,41 +48,78 @@ cd vibe
 npm install
 ```
 
-## Running Locally
-
-- Start the frontend dev server:
+3. Run the development server:
 
 ```bash
 npm run dev
 ```
 
-Open the app in your browser at the address shown by Vite (by default `http://localhost:5173`).
+Open [http://localhost:5173](http://localhost:5173) in your browser. Vite automatically attaches the room relay WebSocket endpoint during local development.
 
-## Build for Production
+---
+
+## Running Tests
+
+Run the built-in Node test suite:
+
+```bash
+npm test
+```
+
+Tests cover puzzle generation uniqueness, bitmask solving, the move engine (`applyMove`), state normalization, monotonic room relay revision merges, presence resolution, date key validation, and time tracking.
+
+---
+
+## Production Build & Server
+
+Build the client assets:
 
 ```bash
 npm run build
-npm run preview
 ```
 
-## Project Structure
+Run the production server (serves static assets and provides the WebSocket relay at `/room-ws`):
 
-- `index.html` — App entry HTML
-- `src/` — React source code
-- `src/main.jsx` & `src/App.jsx` — App bootstrap and main component
-- `src/styles.css` — Tailwind styles and game UI styling
-- `vite.config.js` — Vite configuration
+```bash
+npm start
+# or: npm run server
+```
 
-Adjust paths and filenames as you extend the project.
+By default, the server listens on `http://0.0.0.0:5174`. Set `PORT` in your environment or `.env` to customize the listening port.
 
-## Contributing
+---
 
-- Open issues or PRs for bugs, improvements, or new features.
-- Use feature branches and provide a clear description of changes.
+## Project Architecture
 
-## Troubleshooting
+```
+sudoku/
+├── server.js              # Production static file server + WebSocket relay host
+├── roomRelay.js           # In-memory WebSocket room relay with room revision tracking
+├── vite.config.js         # Vite configuration with embedded dev WebSocket relay
+├── src/
+│   ├── main.jsx           # React root bootstrap and error boundary
+│   ├── App.jsx            # Application shell, screens, overlays, and board UI
+│   ├── styles.css         # Theme CSS variables, Tailwind styles, and grid rules
+│   ├── audio/
+│   │   └── sound.js       # Web Audio API singleton with mute toggle & audio unlock
+│   ├── persist/
+│   │   └── storage.js     # Safe localStorage wrapper with quota guards
+│   └── game/
+│       ├── engine.js      # Pure Sudoku move engine (applyMove)
+│       ├── engine.test.js # Move engine unit tests
+│       ├── formatters.js  # Time and player status formatting helpers
+│       ├── relay.test.js  # Monotonic relay revision & merge tests
+│       ├── store.js       # Zustand store: rooms, daily challenge, stats & snacks
+│       ├── store.test.js  # Store normalization, presence, & timer unit tests
+│       ├── sudoku.js      # Sudoku generator and bitmask solver
+│       └── sudoku.test.js # Solver uniqueness, blanks, & seed determinism tests
+```
 
-- If the dev server fails to start, ensure Node and npm are installed and re-run `npm install`.
-- If UI styling looks incorrect, verify `tailwind.config.js` and `postcss.config.js` are present and configured.
+---
 
+## Relay Protocol & Synchronization
 
+- **Local Discovery:** When playing across multiple tabs on the same device, rooms synchronize immediately via `BroadcastChannel`.
+- **Cross-Device Relay:** Connected clients publish state updates and subscribe to room codes via `/room-ws`.
+- **Monotonic Revisioning:** Room states carry monotonic revision counters (`rev`) to reject stale snapshots and resolve concurrent updates cleanly.
+- **Heartbeat & Presence:** Clients exchange lightweight presence heartbeats every 2.5 seconds to track online/offline voters and spectator states without rebroadcasting full board snapshots.

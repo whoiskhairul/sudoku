@@ -1,4 +1,4 @@
-/* Room relay + static production server for Sudoku Versus.
+/* Room relay + static production server for Sudostrike.
    - Run with: node server.js
    - Serves dist/ when present
    - WebSocket room relay is available at /room-ws
@@ -47,6 +47,6 @@ process.on("uncaughtException", (err) => console.error("Uncaught exception:", er
 process.on("unhandledRejection", (err) => console.error("Unhandled rejection:", err));
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Sudoku Versus server listening on http://0.0.0.0:${PORT}`);
+  console.log(`Sudostrike server listening on http://0.0.0.0:${PORT}`);
   console.log(`Room relay websocket available at ws://0.0.0.0:${PORT}/room-ws`);
 });
