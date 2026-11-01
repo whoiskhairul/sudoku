@@ -193,7 +193,7 @@ function App() {
         ws.addEventListener("error", () => {
           try {
             ws.close();
-          } catch (e) { }
+          } catch (e) {}
         });
       } catch (e) {
         if (!disposed) reconnectTimer = setTimeout(() => connectWs(attempt + 1), 350);
@@ -206,7 +206,7 @@ function App() {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       try {
         useGame.getState().ws?.close();
-      } catch (e) { }
+      } catch (e) {}
       channel.close();
       window.removeEventListener("sv-room-local", onLocal);
       window.removeEventListener("sv-snack", onSnack);
@@ -574,7 +574,7 @@ function Home() {
             Create a room, share the code, wait for everyone to ready up, then solve the same puzzle at the same time.
           </p>
         </div>
-        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="grid gap-3 sm:grid-cols-2">
           <div className="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-4">
             <label className="mb-2 block text-sm font-medium text-[var(--muted)]">Difficulty</label>
             <select

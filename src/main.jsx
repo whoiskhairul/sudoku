@@ -8,7 +8,7 @@ const clearLocalData = () => {
     Object.keys(localStorage)
       .filter((key) => key.startsWith("sv-"))
       .forEach((key) => localStorage.removeItem(key));
-  } catch (e) { }
+  } catch (e) {}
 };
 
 class ErrorBoundary extends React.Component {
